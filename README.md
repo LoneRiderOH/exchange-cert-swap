@@ -9,7 +9,8 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 - **Free certificates (optional)**: requests a certificate from **Let's Encrypt, ZeroSSL, Google Trust Services, SSL.com or Actalis** using the [Posh-ACME](https://poshac.me) module, and passes the resulting PFX straight to validation. Proof of domain ownership, chosen per request:
   - **HTTP-01**: the tool writes the challenge file into IIS on **every** selected server, so it works behind a load balancer. It checks that each server serves the file before the CA is asked to validate.
   - **DNS-01 manual**: the tool shows the `_acme-challenge` TXT records to create, then checks public DNS before continuing. Supports wildcards.
-  - **DNS-01 automatic**: uses any of Posh-ACME's ~90 DNS provider plugins (Cloudflare, Route 53, Azure DNS, GoDaddy and more).
+  - **DNS-01 automatic via Cloudflare**: built-in option for domains hosted on Cloudflare DNS. You paste a scoped API token, and the tool tests it, creates and removes the TXT records itself, and can remember the token, encrypted for your Windows user. It also detects when your names are on Cloudflare DNS.
+  - **DNS-01 automatic via other DNS hosts**: uses any of Posh-ACME's ~90 DNS provider plugins (Route 53, Azure DNS, GoDaddy and more).
 - **Inventory**: lists every Exchange certificate on all selected mailbox servers and marks the **Auth (OAuth)** and **internal transport** certificates.
 - **Validation before changes (read-only)**:
   - the PFX contains a private key, is in its validity period and has the Server Authentication EKU
@@ -102,10 +103,32 @@ All of these issue publicly trusted 90-day domain-validated certificates, which 
    |---|---|---|
    | **HTTP-01** | Port 80 for your mail names reaches the Exchange servers (directly or through a load balancer) | Click **Test HTTP-01 setup** first. It writes a test file to each server's webroot (default `\\{fqdn}\C$\inetpub\wwwroot`), requests it with the certificate name as Host header, and reports redirects, `Require SSL` and 404 errors. A `web.config` in `/.well-known/acme-challenge/` turns off HTTP redirects for that folder only. No wildcards. |
    | **DNS-01 manual** | Port 80 is closed, or you need a wildcard | Click **Request certificate**. Create the TXT records shown, click **Check DNS records** until all are visible, then click **Continue (records added)**. |
-   | **DNS-01 automatic** | Your DNS host has an API | Pick a plugin, click **Show parameters**, and enter the arguments as `Name=Value` lines. Put `secure:` before secrets, for example `CFToken=secure:xxxx`. Secrets are never written to the log. |
+   | **DNS-01 automatic: Cloudflare** | Your public DNS is on Cloudflare | See [Cloudflare DNS](#cloudflare-dns) below. Works with wildcards and with port 80 closed. |
+   | **DNS-01 automatic: other provider** | Your DNS host has an API | Pick a plugin, click **Show parameters**, and enter the arguments as `Name=Value` lines. Put `secure:` before secrets, for example `CFToken=secure:xxxx`. Secrets are never written to the log. |
 
 6. Click **Request certificate**, with Dry run unticked. When the certificate is issued, the tool removes the challenge files or records and opens tab 2 with the PFX already validated. Then continue with tab 3 as usual.
 7. When it works on Staging, switch to a production CA and request again.
+
+### Cloudflare DNS
+
+When your public DNS is hosted on Cloudflare, the tool creates and deletes the `_acme-challenge` TXT records through the Cloudflare API. You don't need to open port 80, and wildcards work. If the names on the certificate resolve to Cloudflare nameservers, the tab shows **"Detected: … uses Cloudflare DNS"**.
+
+1. **Create an API token.** Go to *dash.cloudflare.com → My Profile → API Tokens → Create Token* and use the **Edit zone DNS** template. It needs these permissions:
+   - **Zone → DNS → Edit**
+   - **Zone → Zone → Read**
+
+   Under *Zone Resources*, choose your zone, or *All zones* if the certificate covers several. Don't use the Global API Key.
+2. Select **DNS-01 automatic: Cloudflare (API token)** and paste the token. Typing a token selects this option automatically.
+3. Click **Test Cloudflare token**. It checks:
+   - that the token is active (for account-owned tokens this check shows INFO instead, which is expected);
+   - that each name maps to a Cloudflare zone, using the deepest matching zone, so delegated sub-zones work;
+   - that it can read DNS records;
+   - **with Dry run off**, that it can write, by creating and immediately deleting one `_certtool-test-….<zone>` TXT record.
+4. Click **Request certificate**. The same check runs again before ordering, so a bad token stops the request before the CA is contacted.
+
+The token is never written to the log. If you tick **Remember the token**, it is stored in `%LOCALAPPDATA%\ExchangeCertTool\cloudflare-token.dpapi`, encrypted with Windows DPAPI. Only the same Windows user on the same server can decrypt it, and it is loaded again the next time the tool starts, which makes renewals quicker. Untick the box and run the test again to delete the saved token.
+
+Proxied (orange-cloud) records don't matter, because DNS-01 only uses TXT records.
 
 Posh-ACME keeps the account, the orders and the issued files in `%LOCALAPPDATA%\Posh-ACME` for the user who ran the tool. The log shows the PFX path. The PFX password is stored with the order: `(Get-PAOrder <name>).PfxPass`.
 

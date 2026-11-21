@@ -920,7 +920,170 @@ function Install-PoshAcme {
     Update-LeModuleStatus
 }
 
+# ---------------------------------------------------------------------------------------------
+# Cloudflare DNS (DNS-01 automatic) - uses the Posh-ACME "Cloudflare" plugin with a scoped API token
+# ---------------------------------------------------------------------------------------------
+$script:CfApi = 'https://api.cloudflare.com/client/v4'
+$script:CfTokenFile = Join-Path $env:LOCALAPPDATA 'ExchangeCertTool\cloudflare-token.dpapi'
+
+function Get-CfToken {
+    $t = $script:ui.LeCfTokenBox.Password.Trim()
+    if (-not $t) { throw 'Enter the Cloudflare API token.' }
+    if ($t -match '\s') { throw 'The Cloudflare API token must not contain spaces.' }
+    $t
+}
+
+function Invoke-CfApi {
+    param([Parameter(Mandatory)][string]$Path, [string]$Method = 'GET', [hashtable]$Query, $Body, [Parameter(Mandatory)][string]$Token)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $uri = $script:CfApi + $Path
+    if ($Query) { $uri += '?' + (($Query.GetEnumerator() | ForEach-Object { '{0}={1}' -f $_.Key, [uri]::EscapeDataString("$($_.Value)") }) -join '&') }
+    $p = @{ Uri = $uri; Method = $Method; Headers = @{ Authorization = "Bearer $Token" }; ContentType = 'application/json'; UseBasicParsing = $true; TimeoutSec = 30; ErrorAction = 'Stop' }
+    if ($null -ne $Body) { $p.Body = ($Body | ConvertTo-Json -Compress -Depth 5) }
+    try { Invoke-RestMethod @p }
+    catch {
+        $detail = $_.Exception.Message
+        try {
+            $resp = $_.Exception.Response
+            if ($resp) {
+                $sr = New-Object System.IO.StreamReader($resp.GetResponseStream()); $raw = $sr.ReadToEnd(); $sr.Close()
+                $j = $raw | ConvertFrom-Json
+                if ($j.errors) { $detail = (@($j.errors | ForEach-Object { "$($_.code): $($_.message)" }) -join '; ') }
+            }
+        }
+        catch { }
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            try { $j = $_.ErrorDetails.Message | ConvertFrom-Json; if ($j.errors) { $detail = (@($j.errors | ForEach-Object { "$($_.code): $($_.message)" }) -join '; ') } } catch { }
+        }
+        throw "Cloudflare API $Method $Path failed: $detail"
+    }
+}
+
+# Finds the deepest Cloudflare zone that contains $Name (same logic as the Posh-ACME plugin).
+function Find-CfZone {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Token)
+    $pieces = ($Name -replace '^\*\.', '').Split('.')
+    for ($i = 0; $i -lt ($pieces.Count - 1); $i++) {
+        $candidate = $pieces[$i..($pieces.Count - 1)] -join '.'
+        $r = Invoke-CfApi -Path '/zones' -Query @{ name = $candidate } -Token $Token
+        if ($r.result -and @($r.result).Count -gt 0) { return @($r.result)[0] }
+    }
+    return $null
+}
+
+function Test-CloudflareSetup {
+    param([switch]$Quiet)
+    $token = Get-CfToken
+    $names = @(Get-LeNames)
+    $rows = New-Object System.Collections.Generic.List[object]
+    $ok = $true
+
+    try {
+        $v = Invoke-CfApi -Path '/user/tokens/verify' -Token $token
+        $rows.Add([pscustomobject]@{ Name = '(API token)'; Type = 'verify'; Record = "status: $($v.result.status)"; Value = ''; Status = $(if ("$($v.result.status)" -eq 'active') { 'PASS' } else { 'FAIL - token is not active' }) })
+        if ("$($v.result.status)" -ne 'active') { $ok = $false }
+    }
+    catch {
+        # Account-owned tokens cannot use /user/tokens/verify; the zone lookups below still prove they work.
+        $rows.Add([pscustomobject]@{ Name = '(API token)'; Type = 'verify'; Record = ''; Value = ''; Status = "INFO - $($_.Exception.Message) (normal for account-owned tokens; zone checks below decide)" })
+    }
+
+    $zones = @{}
+    foreach ($n in $names) {
+        try {
+            $z = Find-CfZone -Name $n -Token $token
+            if (-not $z) {
+                $rows.Add([pscustomobject]@{ Name = $n; Type = 'zone'; Record = ''; Value = ''; Status = 'FAIL - no Cloudflare zone found. The token needs Zone:Read for this zone, or the domain is not on Cloudflare DNS.' })
+                $ok = $false; continue
+            }
+            $zones["$($z.id)"] = $z
+            $rows.Add([pscustomobject]@{ Name = $n; Type = 'zone'; Record = "_acme-challenge.$($n -replace '^\*\.', '')"; Value = "zone $($z.name)"; Status = $(if ("$($z.status)" -eq 'active') { 'PASS' } else { "WARN - zone status is '$($z.status)'" }) })
+        }
+        catch { $rows.Add([pscustomobject]@{ Name = $n; Type = 'zone'; Record = ''; Value = ''; Status = "FAIL - $($_.Exception.Message)" }); $ok = $false }
+    }
+
+    foreach ($z in $zones.Values) {
+        try {
+            [void](Invoke-CfApi -Path "/zones/$($z.id)/dns_records" -Query @{ type = 'TXT'; per_page = 5 } -Token $token)
+            $rows.Add([pscustomobject]@{ Name = $z.name; Type = 'DNS read'; Record = ''; Value = ''; Status = 'PASS' })
+        }
+        catch { $rows.Add([pscustomobject]@{ Name = $z.name; Type = 'DNS read'; Record = ''; Value = ''; Status = "FAIL - $($_.Exception.Message)" }); $ok = $false; continue }
+
+        $testName = "_certtool-test-$([guid]::NewGuid().ToString('N').Substring(0, 8)).$($z.name)"
+        if (Test-DryRun) {
+            Write-Log "[DRY RUN] would create and delete TXT $testName in zone $($z.name) to prove DNS edit permission" CMD
+            $rows.Add([pscustomobject]@{ Name = $z.name; Type = 'DNS edit'; Record = $testName; Value = ''; Status = 'SKIPPED - untick Dry run to test write access (creates and deletes one TXT record)' })
+            continue
+        }
+        try {
+            Write-Log "Cloudflare: create TXT $testName (write test)" CMD
+            $created = Invoke-CfApi -Path "/zones/$($z.id)/dns_records" -Method POST -Body @{ type = 'TXT'; name = $testName; content = 'exchange-cert-tool write test'; ttl = 60 } -Token $token
+            try {
+                Write-Log "Cloudflare: delete TXT $testName" CMD
+                [void](Invoke-CfApi -Path "/zones/$($z.id)/dns_records/$($created.result.id)" -Method DELETE -Token $token)
+                $rows.Add([pscustomobject]@{ Name = $z.name; Type = 'DNS edit'; Record = $testName; Value = ''; Status = 'PASS (created and deleted a test TXT record)' })
+            }
+            catch {
+                $rows.Add([pscustomobject]@{ Name = $z.name; Type = 'DNS edit'; Record = $testName; Value = ''; Status = "WARN - created but could not delete: $($_.Exception.Message). Delete it in the Cloudflare dashboard." })
+            }
+        }
+        catch { $rows.Add([pscustomobject]@{ Name = $z.name; Type = 'DNS edit'; Record = $testName; Value = ''; Status = "FAIL - $($_.Exception.Message). The token needs Zone > DNS > Edit." }); $ok = $false }
+    }
+
+    foreach ($r in $rows) { Write-Log ("Cloudflare check {0} [{1}]: {2}" -f $r.Name, $r.Type, $r.Status) $(if ($r.Status -like 'FAIL*') { 'ERROR' } elseif ($r.Status -like 'PASS*') { 'OK' } else { 'INFO' }) }
+    if (-not $Quiet) {
+        $script:ui.LeGrid.ItemsSource = (ConvertTo-DataTable $rows.ToArray() @('Name', 'Type', 'Record', 'Value', 'Status')).DefaultView
+        $script:ui.LeStatusText.Text = if ($ok) { 'Cloudflare token works for all names.' } else { 'Cloudflare check found problems - see the Status column.' }
+    }
+    if ($ok) { Save-CfToken }
+    return $ok
+}
+
+function Save-CfToken {
+    if (-not $script:ui.LeCfRememberCheck.IsChecked) {
+        if (Test-Path -LiteralPath $script:CfTokenFile) { Remove-Item -LiteralPath $script:CfTokenFile -Force; Write-Log 'Removed the saved Cloudflare token.' }
+        return
+    }
+    $dir = Split-Path $script:CfTokenFile
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    # DPAPI (CurrentUser): only this Windows user on this machine can decrypt it.
+    $script:ui.LeCfTokenBox.SecurePassword | ConvertFrom-SecureString | Set-Content -LiteralPath $script:CfTokenFile -Encoding ASCII
+    Write-Log "Cloudflare token saved encrypted for $env:USERDOMAIN\$env:USERNAME ($script:CfTokenFile)."
+}
+
+function Restore-CfToken {
+    if (-not (Test-Path -LiteralPath $script:CfTokenFile)) { return }
+    try {
+        $sec = Get-Content -LiteralPath $script:CfTokenFile -Raw | ForEach-Object { $_.Trim() } | ConvertTo-SecureString
+        $script:ui.LeCfTokenBox.Password = (New-Object System.Net.NetworkCredential('', $sec)).Password
+        $script:ui.LeCfRememberCheck.IsChecked = $true
+        Write-Log 'Loaded the saved Cloudflare token.'
+    }
+    catch { Write-Log "Could not read the saved Cloudflare token (saved by another user?): $($_.Exception.Message)" WARN }
+}
+
+# Hint: are the names hosted on Cloudflare DNS? (public NS lookup, no token needed)
+function Get-CfDnsHint {
+    $names = @()
+    try { $names = @(Get-LeNames) } catch { return }
+    $onCf = @()
+    foreach ($n in $names) {
+        $pieces = ($n -replace '^\*\.', '').Split('.')
+        for ($i = 0; $i -lt ($pieces.Count - 1); $i++) {
+            $cand = $pieces[$i..($pieces.Count - 1)] -join '.'
+            $ns = @(Resolve-PublicName -Name $cand -Type NS | Where-Object { $_.Type -eq 'NS' -and "$($_.Section)" -eq 'Answer' } | ForEach-Object { "$($_.NameHost)" })
+            if ($ns) { if ($ns -match '\.ns\.cloudflare\.com$') { $onCf += $cand }; break }
+        }
+    }
+    $onCf = @($onCf | Select-Object -Unique)
+    if ($onCf) {
+        Write-Log "Public DNS for $($onCf -join ', ') is hosted on Cloudflare - the ""DNS-01 automatic: Cloudflare"" option can create the TXT records for you." OK
+        $script:ui.LeCfDetectedText.Text = "Detected: $($onCf -join ', ') uses Cloudflare DNS."
+    }
+}
+
 function Get-LeMode {
+    if ($script:ui.LeCfRadio.IsChecked) { return 'Cloudflare' }
     if ($script:ui.LeDnsManualRadio.IsChecked) { return 'DNSManual' }
     if ($script:ui.LeDnsPluginRadio.IsChecked) { return 'DNSPlugin' }
     return 'HTTP'
@@ -1015,8 +1178,8 @@ function Set-LeNamesFromCurrentCert {
 function Invoke-LeAutoFill {
     if ($script:ui.LeNamesBox.Text.Trim()) { return }
     try {
-        if (Set-LeNamesFromCurrentCert -Auto) { return }
-        Set-LeNamesFromExchange
+        if (-not (Set-LeNamesFromCurrentCert -Auto)) { Set-LeNamesFromExchange }
+        Get-CfDnsHint
     }
     catch { Write-Log "Could not pre-fill certificate names: $($_.Exception.Message)" WARN }
 }
@@ -1271,14 +1434,24 @@ function Start-LeRequest {
     if ($provider.Eab -and [bool]$eabKid -ne [bool]$eabHmac) { throw 'Enter both the EAB key ID and the EAB HMAC key (or neither, if an ACME account for this provider already exists).' }
     $keyLen = "$($script:ui.LeKeyCombo.SelectedItem.Content)"
     $plugin = $null; $pluginArgs = $null; $roots = @()
-    if ($mode -eq 'DNSPlugin') {
+    if ($mode -eq 'Cloudflare') {
+        $null = Get-CfToken
+        if (-not (Test-DryRun)) {
+            Write-Log 'Checking the Cloudflare token and zones before ordering...'
+            if (-not (Test-CloudflareSetup -Quiet)) { throw 'The Cloudflare check failed - click "Test Cloudflare token" to see the details.' }
+        }
+        $mode = 'DNSPlugin'
+        $plugin = 'Cloudflare'
+        $pluginArgs = @{ CFToken = $script:ui.LeCfTokenBox.SecurePassword.Copy() }
+    }
+    elseif ($mode -eq 'DNSPlugin') {
         $plugin = $script:ui.LePluginCombo.Text.Trim()
         if (-not $plugin) { throw 'Choose a DNS plugin (e.g. Cloudflare, Route53, Azure).' }
         $pluginArgs = ConvertFrom-LePluginArgs $script:ui.LePluginArgsBox.Text
     }
     if ($mode -eq 'HTTP') { $roots = @(Get-LeWebroots) }
 
-    $modeText = @{ HTTP = 'HTTP-01 (file in IIS)'; DNSManual = 'DNS-01 (you add TXT records)'; DNSPlugin = "DNS-01 via plugin $plugin" }[$mode]
+    $modeText = @{ HTTP = 'HTTP-01 (file in IIS)'; DNSManual = 'DNS-01 (you add TXT records)'; DNSPlugin = $(if ($plugin -eq 'Cloudflare') { 'DNS-01 automatic via Cloudflare API' } else { "DNS-01 via plugin $plugin" }) }[$mode]
     $msg = "Request a certificate from $($provider.Label)`n`n" +
     "Names:`n  $($names -join "`n  ")`n`nChallenge: $modeText`nKey: RSA $keyLen"
     if ($mode -eq 'HTTP') { $msg += "`n`nChallenge files will be written to:`n  $(($roots | ForEach-Object { $_.Root }) -join "`n  ")" }
@@ -1321,6 +1494,7 @@ function Start-LeRequest {
     Write-Log "Order $($order.Name) created, status $($order.status)."
 
     $script:Le.Provider = $provider
+    if ($plugin -eq 'Cloudflare') { Save-CfToken }
     $script:Le.Mode = $mode; $script:Le.Plugin = $plugin; $script:Le.PluginArgs = $pluginArgs; $script:Le.Names = $names
     $challenges = New-Object System.Collections.Generic.List[object]
     try {
@@ -1620,7 +1794,18 @@ function Show-LePluginParams {
               <TextBlock Margin="20,4,0,2" TextWrapping="Wrap" Text="Webroot of Default Web Site, written on every selected server ({server} and {fqdn} are replaced):"/>
               <TextBox x:Name="LeWebrootBox" Margin="20,0,0,0" FontFamily="Consolas" Text="\\{fqdn}\C$\inetpub\wwwroot"/>
               <RadioButton x:Name="LeDnsManualRadio" GroupName="LeMode" Margin="0,10,0,0" Content="DNS-01 manual: the tool shows TXT records, you create them"/>
-              <RadioButton x:Name="LeDnsPluginRadio" GroupName="LeMode" Margin="0,6,0,0" Content="DNS-01 automatic: DNS provider API (Posh-ACME plugin)"/>
+              <RadioButton x:Name="LeCfRadio" GroupName="LeMode" Margin="0,6,0,0" Content="DNS-01 automatic: Cloudflare (API token)"/>
+              <StackPanel Margin="20,4,0,0">
+                <TextBlock x:Name="LeCfDetectedText" Foreground="DarkGreen" TextWrapping="Wrap"/>
+                <TextBlock TextWrapping="Wrap" Foreground="DimGray"
+                           Text="Create a token at dash.cloudflare.com > My Profile > API Tokens > Create Token > template 'Edit zone DNS'. Permissions: Zone > DNS > Edit and Zone > Zone > Read, for your zone(s). Wildcards work. The token is never logged."/>
+                <DockPanel Margin="0,4,0,0">
+                  <Button x:Name="LeCfTestButton" DockPanel.Dock="Right" Content="Test Cloudflare token" Margin="8,0,0,0"/>
+                  <PasswordBox x:Name="LeCfTokenBox"/>
+                </DockPanel>
+                <CheckBox x:Name="LeCfRememberCheck" Margin="0,4,0,0" Content="Remember the token for this Windows user (DPAPI-encrypted)"/>
+              </StackPanel>
+              <RadioButton x:Name="LeDnsPluginRadio" GroupName="LeMode" Margin="0,8,0,0" Content="DNS-01 automatic: other DNS provider (Posh-ACME plugin)"/>
               <DockPanel Margin="20,4,0,2">
                 <Button x:Name="LePluginParamsButton" DockPanel.Dock="Right" Content="Show parameters" Margin="8,0,0,0"/>
                 <ComboBox x:Name="LePluginCombo" IsEditable="True"/>
@@ -1718,7 +1903,7 @@ function New-MainWindow {
 }
 
 $script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'ImportButton', 'EnableButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
-'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
+'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeCfTestButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
     param([string]$Name, [scriptblock]$Body)
@@ -1775,6 +1960,9 @@ function Register-UiEvents {
     Update-AcmeProviderUi
     $ui.LeProviderCombo.Add_SelectionChanged({ Update-AcmeProviderUi })
     $ui.LeZeroSslEabButton.Add_Click({ Invoke-UiAction 'ZeroSSL EAB' { Get-ZeroSslEab } })
+    $ui.LeCfTestButton.Add_Click({ Invoke-UiAction 'Cloudflare test' { $script:ui.LeCfRadio.IsChecked = $true; [void](Test-CloudflareSetup) } })
+    $ui.LeCfTokenBox.Add_PasswordChanged({ if ($script:ui.LeCfTokenBox.Password) { $script:ui.LeCfRadio.IsChecked = $true } })
+    Restore-CfToken
     $ui.LeRecheckModuleButton.Add_Click({ Invoke-UiAction 'Re-check Posh-ACME' { Update-LeModuleStatus } })
     $ui.LePluginParamsButton.Add_Click({ Invoke-UiAction 'Plugin parameters' { Show-LePluginParams } })
     $ui.LeTestHttpButton.Add_Click({ Invoke-UiAction 'HTTP-01 test' { Test-LeHttpSetup } })
