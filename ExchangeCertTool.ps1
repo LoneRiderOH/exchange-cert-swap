@@ -1570,7 +1570,15 @@ function Show-LePluginParams {
       <TabItem Header="1b. Free certificate (ACME)">
         <Grid Margin="8">
           <Grid.ColumnDefinitions><ColumnDefinition Width="480"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-          <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Margin="0,0,10,0">
+          <DockPanel Grid.Column="0" Margin="0,0,10,0">
+          <WrapPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
+            <Button x:Name="LeTestHttpButton" Content="Test HTTP-01 setup" Margin="0,0,8,6"/>
+            <Button x:Name="LeRequestButton" Content="Request certificate" FontWeight="Bold" Margin="0,0,8,6"/>
+            <Button x:Name="LeCheckDnsButton" Content="Check DNS records" Margin="0,0,8,6"/>
+            <Button x:Name="LeContinueButton" Content="Continue (records added)" Margin="0,0,8,6"/>
+            <Button x:Name="LeCleanupButton" Content="Clean up challenges" Margin="0,0,8,6"/>
+          </WrapPanel>
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel Margin="0,0,8,0">
               <TextBlock TextWrapping="Wrap" Foreground="DimGray"
                          Text="Gets a free certificate from Let's Encrypt, ZeroSSL, Google, SSL.com or Actalis (via the Posh-ACME module) and hands the PFX to tab 2. Try a Staging provider first: it proves the challenge works without hitting rate limits. Staging certificates are untrusted and cannot be imported."/>
@@ -1620,15 +1628,9 @@ function Show-LePluginParams {
               <TextBlock Margin="20,2,0,2" TextWrapping="Wrap" Foreground="DimGray"
                          Text="Plugin arguments, one per line as Name=Value. Prefix secrets with secure: (CFToken=secure:abc123). Lists as [a,b]. Values are never logged or saved."/>
               <TextBox x:Name="LePluginArgsBox" Margin="20,0,0,0" Height="70" AcceptsReturn="True" FontFamily="Consolas" VerticalScrollBarVisibility="Auto"/>
-              <WrapPanel Margin="0,12,0,0">
-                <Button x:Name="LeTestHttpButton" Content="Test HTTP-01 setup" Margin="0,0,8,6"/>
-                <Button x:Name="LeRequestButton" Content="Request certificate" FontWeight="Bold" Margin="0,0,8,6"/>
-                <Button x:Name="LeCheckDnsButton" Content="Check DNS records" Margin="0,0,8,6"/>
-                <Button x:Name="LeContinueButton" Content="Continue (records added)" Margin="0,0,8,6"/>
-                <Button x:Name="LeCleanupButton" Content="Clean up challenges" Margin="0,0,8,6"/>
-              </WrapPanel>
             </StackPanel>
           </ScrollViewer>
+          </DockPanel>
           <DockPanel Grid.Column="1">
             <TextBlock x:Name="LeStatusText" DockPanel.Dock="Top" TextWrapping="Wrap" Foreground="DimGray"
                        Text="Challenges, TXT records and test results appear here. The issued PFX is loaded into tab 2 automatically."/>

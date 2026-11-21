@@ -2,7 +2,7 @@
 
 A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certificate on on-premises **Exchange Server 2016, 2019 and Subscription Edition** mailbox servers, using a PFX file or a **free certificate** from Let's Encrypt, ZeroSSL, Google Trust Services, SSL.com or Actalis. It covers the whole process: inventory, validation, import, enable, verification and safe removal of the old certificate. **Dry run** is on by default.
 
-![Screenshot](docs/screenshot.png)
+![Main window](docs/main-window.png)
 
 ## Features
 
@@ -74,7 +74,7 @@ After step 3, update any connectors reported on tab 2 with the command the tool 
 
 ## Free certificates (ACME)
 
-![Free certificate tab](docs/letsencrypt.png)
+![Free certificate tab](docs/free-certificate-tab.png)
 
 ### Certificate authorities
 
