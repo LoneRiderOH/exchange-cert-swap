@@ -577,6 +577,156 @@ function Invoke-UpdateConnectors {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Step 2 alternatives: a certificate that is already installed, or one Posh-ACME saved earlier
+# ---------------------------------------------------------------------------------------------
+# One entry per CA-issued certificate found on the selected servers (from the inventory).
+function Get-InstalledCertChoices {
+    if (-not $script:State.Inventory) { Update-Inventory }
+    $rows = @($script:State.Inventory | Where-Object { $_.SelfSigned -ne 'True' })
+    foreach ($g in $rows | Group-Object Thumbprint) {
+        $r = $g.Group[0]
+        $onIis = @($g.Group | Where-Object { ($_.Services -split ',') -contains 'IIS' } | ForEach-Object { $_.Server })
+        [pscustomobject]@{
+            Thumbprint = $r.Thumbprint; Subject = $r.Subject; Issuer = $r.Issuer; NotAfter = $r.NotAfter
+            Domains    = @("$($r.Domains)" -split '\s*,\s*' | Where-Object { $_ })
+            Servers    = @($g.Group | ForEach-Object { $_.Server }); IisServers = $onIis
+            Label      = ('{0}  exp {1:yyyy-MM-dd}  {2}  on {3}{4}' -f $r.Subject, $r.NotAfter, $r.Thumbprint.Substring(0, [Math]::Min(8, $r.Thumbprint.Length)),
+                ((@($g.Group | ForEach-Object { $_.Server })) -join ', '), $(if ($onIis) { "  [IIS: $($onIis -join ', ')]" } else { '' }))
+        }
+    }
+}
+
+function Update-InventoryAndInstalled { Update-Inventory; Update-InstalledCertList }
+
+function Update-InstalledCertList {
+    Assert-Exchange
+    $choices = @(Get-InstalledCertChoices | Sort-Object @{ e = { [bool]$_.IisServers.Count }; Descending = $true }, @{ e = { $_.NotAfter }; Descending = $true })
+    $script:InstalledChoices = $choices
+    $script:ui.InstalledCertCombo.Items.Clear()
+    foreach ($c in $choices) { [void]$script:ui.InstalledCertCombo.Items.Add($c.Label) }
+    if ($choices) { $script:ui.InstalledCertCombo.SelectedIndex = 0 }
+    Write-Log "Found $($choices.Count) CA-issued certificate(s) installed on the selected servers."
+}
+
+# Uses a certificate that is already in Exchange (e.g. issued earlier and already bound to IIS)
+# as the "new" certificate - no PFX needed for Step B/C, Verify and Remove old.
+function Invoke-UseInstalledCertificate {
+    Assert-Exchange
+    if (-not $script:InstalledChoices) { Update-InstalledCertList }
+    $i = $script:ui.InstalledCertCombo.SelectedIndex
+    if ($i -lt 0 -or $i -ge @($script:InstalledChoices).Count) { throw 'No installed CA-issued certificate found on the selected servers.' }
+    $c = $script:InstalledChoices[$i]
+    $servers = @(Get-SelectedServers)
+
+    $script:ui.PfxPathBox.Text = ''
+    $script:ui.PfxPasswordBox.Password = ''
+    Reset-Validation
+
+    $sb = New-Object System.Text.StringBuilder
+    $out = { param([string]$t = '') [void]$sb.AppendLine($t) }
+    $errors = New-Object System.Collections.Generic.List[string]
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $days = [int][math]::Floor(([datetime]$c.NotAfter - (Get-Date)).TotalDays)
+    $cn = if ("$($c.Subject)" -match '(?:^|,\s*)CN=([^,]+)') { $Matches[1].Trim().ToLowerInvariant() } else { $null }
+    $names = @(@($c.Domains | ForEach-Object { "$_".ToLowerInvariant() }) + @($cn) | Where-Object { $_ } | Select-Object -Unique)
+
+    & $out '=== INSTALLED CERTIFICATE (no PFX) ==='
+    & $out "Subject     : $($c.Subject)"
+    & $out "Issuer      : $($c.Issuer)"
+    & $out "Thumbprint  : $($c.Thumbprint)"
+    & $out ("Expires     : {0:yyyy-MM-dd}  ({1} days left)" -f $c.NotAfter, $days)
+    & $out "Names       : $($names -join ', ')"
+    & $out ''
+    & $out '=== WHERE IT IS ==='
+    foreach ($s in $servers) {
+        $row = $script:State.Inventory | Where-Object { $_.Server -eq $s -and $_.Thumbprint -eq $c.Thumbprint } | Select-Object -First 1
+        if ($row) { & $out ("  {0,-12} present, services: {1}" -f $s, $(if ($row.Services) { $row.Services } else { 'None' })) }
+        else { & $out ("  {0,-12} NOT present - Step A copies it from {1} (needs an exportable private key)" -f $s, ($c.Servers -join ', ')) }
+    }
+    & $out ''
+
+    if ([datetime]$c.NotAfter -lt (Get-Date)) { $errors.Add('Certificate is EXPIRED.') }
+    elseif ($days -lt 30) { $warnings.Add("Certificate expires in $days days.") }
+    if ("$($c.Issuer)" -match '\(STAGING\)|Fake LE|Pebble|\bTest\b|Staging') { $errors.Add('This is a STAGING/test certificate - clients do not trust it.') }
+
+    $missing = @()
+    if ($servers) {
+        & $out '=== HOST NAMES USED BY EXCHANGE ==='
+        foreach ($g in (@(Get-ExchangeHostNames -Servers $servers) | Group-Object Host | Sort-Object Name)) {
+            $ok = Test-HostCovered -HostName $g.Name -CertNames $names
+            & $out ("  [{0}] {1}" -f $(if ($ok) { ' OK ' } else { 'MISS' }), $g.Name)
+            if (-not $ok) { $missing += $g.Name }
+        }
+        if ($missing) { $warnings.Add("Not covered by the certificate: $($missing -join ', ')") }
+        & $out ''
+    }
+
+    & $out '=== RESULT ==='
+    foreach ($e in $errors) { & $out "  ERROR: $e" }
+    foreach ($w in $warnings) { & $out "  WARN : $w" }
+    if (-not $errors.Count) {
+        & $out '  Using this certificate. Next: tab 3 (Step B/C as needed), tab 4 Verify, tab 5 Remove old.'
+        $script:State.Validated = $true
+        $script:State.NewCert = [pscustomobject]@{ Subject = "$($c.Subject)"; Issuer = "$($c.Issuer)"; Thumbprint = "$($c.Thumbprint)"; NotAfter = $c.NotAfter }
+        $script:State.NewThumb = "$($c.Thumbprint)"
+        $script:State.NewNames = $names
+        $script:State.PfxPath = $null
+        $script:State.PfxPassword = $null
+        $script:State.MissingHosts = $missing
+        $script:State.Verified = @{}
+    }
+    $script:ui.ValidationBox.Text = $sb.ToString()
+    if ($errors.Count) { Write-Log "Installed certificate $($c.Thumbprint) cannot be used: $($errors -join ' ')" ERROR; return }
+    Write-Log "Using installed certificate $($c.Thumbprint) ($($c.Subject)) as the new certificate - no PFX needed." OK
+    try { Update-ConnectorPreview } catch { Write-Log "Connector preview failed: $($_.Exception.Message)" WARN }
+}
+
+function Get-PoshAcmeHome {
+    if ($env:POSHACME_HOME) {
+        $h = [Environment]::ExpandEnvironmentVariables($env:POSHACME_HOME)
+        if (Test-Path -LiteralPath $h) { return $h }
+    }
+    Join-Path $env:LOCALAPPDATA 'Posh-ACME'
+}
+
+# Finds certificates Posh-ACME saved earlier (fullchain.pfx next to order.json), newest first.
+function Find-AcmeSavedCertificates {
+    $root = Get-PoshAcmeHome
+    if (-not (Test-Path -LiteralPath $root)) { return @() }
+    foreach ($pfx in @(Get-ChildItem -LiteralPath $root -Filter 'fullchain.pfx' -Recurse -File -ErrorAction SilentlyContinue)) {
+        $orderFile = Join-Path $pfx.DirectoryName 'order.json'
+        $pw = ''; $main = $pfx.Directory.Name; $expires = $null
+        if (Test-Path -LiteralPath $orderFile) {
+            try {
+                $o = Get-Content -LiteralPath $orderFile -Raw | ConvertFrom-Json
+                if ($o.PfxPassB64U) {
+                    $b = "$($o.PfxPassB64U)".Replace('-', '+').Replace('_', '/')
+                    switch ($b.Length % 4) { 2 { $b += '==' } 3 { $b += '=' } }
+                    $pw = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b))
+                }
+                elseif ($o.PfxPass) { $pw = "$($o.PfxPass)" }
+                if ($o.MainDomain) { $main = "$($o.MainDomain)" }
+                if ($o.CertExpires) { $expires = [datetime]::Parse("$($o.CertExpires)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal) }
+            }
+            catch { }
+        }
+        [pscustomobject]@{ Path = $pfx.FullName; Password = $pw; MainDomain = $main; Expires = $expires; Written = $pfx.LastWriteTime
+            Server = (Split-Path (Split-Path (Split-Path $pfx.DirectoryName -Parent) -Parent) -Leaf) }
+    }
+}
+
+function Invoke-LoadAcmeSaved {
+    $found = @(Find-AcmeSavedCertificates | Sort-Object Written -Descending)
+    if (-not $found) { throw "No certificate saved by Posh-ACME was found under $(Get-PoshAcmeHome) for $env:USERNAME. If it was issued under another Windows account, run the tool as that user, or use the installed certificate instead." }
+    foreach ($f in $found) { Write-Log ("Posh-ACME certificate: {0}  ({1}, saved {2:yyyy-MM-dd HH:mm}{3})  {4}" -f $f.MainDomain, $f.Server, $f.Written, $(if ($f.Expires) { ", expires {0:yyyy-MM-dd}" -f $f.Expires } else { '' }), $f.Path) }
+    $pick = $found[0]
+    $script:ui.PfxPathBox.Text = $pick.Path
+    $script:ui.PfxPasswordBox.Password = $pick.Password
+    Write-Log "Loaded the newest Posh-ACME certificate ($($pick.MainDomain), $($pick.Server)). Validating..." OK
+    Invoke-ValidatePfx
+}
+
+# ---------------------------------------------------------------------------------------------
 # Step 2: validate PFX
 # ---------------------------------------------------------------------------------------------
 function Reset-Validation {
@@ -738,6 +888,42 @@ function Invoke-ValidatePfx {
 # ---------------------------------------------------------------------------------------------
 # Step 3: import + enable
 # ---------------------------------------------------------------------------------------------
+# Step A when the certificate came from Exchange instead of a PFX: export it from a server that has it
+# (needs an exportable private key) and import it on the selected servers that do not.
+function Copy-InstalledCertificate {
+    param([string[]]$Servers, [bool]$Exportable)
+    $thumb = $script:State.NewThumb
+    $have = @(); $need = @()
+    foreach ($s in $Servers) { if (Get-ExchangeCertSafe -Server $s -Thumbprint $thumb) { $have += $s } else { $need += $s } }
+    if (-not $need) { Write-Log "Certificate $thumb is already on all selected servers - nothing to import. Continue with Step B / Step C." OK; return }
+    if (-not $have) {
+        $others = @($script:State.Servers.Keys | Where-Object { $_ -notin $Servers -and (Get-ExchangeCertSafe -Server $_ -Thumbprint $thumb) })
+        $have = $others
+    }
+    $src = $null
+    foreach ($s in $have) { $c = Get-ExchangeCertSafe -Server $s -Thumbprint $thumb; if ($c -and "$($c.PrivateKeyExportable)" -eq 'True') { $src = $s; break } }
+    if (-not $src) {
+        throw ("Certificate $thumb is missing on $($need -join ', ') and cannot be copied: its private key is not exportable on $($have -join ', '). " +
+            'Load the original PFX instead (button "Load last Let''s Encrypt/ACME certificate" on tab 2, or Browse).')
+    }
+    Write-Log "Will copy certificate $thumb from $src to $($need -join ', ')."
+    Invoke-Step "Export-ExchangeCertificate -Server $src -Thumbprint $thumb -BinaryEncoded -Password <random>; Import-ExchangeCertificate on $($need -join ', ')" {
+        $pw = New-RandomSecurePassword
+        $exp = Export-ExchangeCertificate -Server $src -Thumbprint $thumb -BinaryEncoded -Password $pw -ErrorAction Stop
+        $bytes = if ($exp -is [byte[]]) { $exp } else { [byte[]]$exp.FileData }
+        if (-not $bytes -or $bytes.Length -lt 100) { throw "Export from $src returned no data." }
+        foreach ($s in $need) {
+            try {
+                Import-ExchangeCertificate -Server $s -FileData $bytes -Password $pw -PrivateKeyExportable:$Exportable -ErrorAction Stop | Out-Null
+                if (Get-ExchangeCertSafe -Server $s -Thumbprint $thumb) { Write-Log "${s}: certificate copied from $src." OK }
+                else { Write-Log "${s}: import returned no error, but the certificate is not visible." ERROR }
+            }
+            catch { Write-Log "${s}: import FAILED: $($_.Exception.Message)" ERROR }
+        }
+    }
+    if (-not (Test-DryRun)) { Update-Inventory }
+}
+
 function Invoke-ImportCertificate {
     Assert-Exchange; Assert-Validated
     $servers = Get-SelectedServers
@@ -749,6 +935,10 @@ function Invoke-ImportCertificate {
     if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
     if (-not (Confirm-Action $msg 'Import certificate')) { Write-Log 'Import cancelled.' WARN; return }
 
+    if (-not $script:State.PfxPath) {
+        Copy-InstalledCertificate -Servers $servers -Exportable $exportable
+        return
+    }
     $bytes = [System.IO.File]::ReadAllBytes($script:State.PfxPath)
     $pw = $script:State.PfxPassword
     foreach ($s in $servers) {
@@ -1989,18 +2179,26 @@ function Show-LePluginParams {
         </Grid>
       </TabItem>
 
-      <TabItem Header="2. New certificate (PFX)">
+      <TabItem Header="2. New certificate">
         <Grid Margin="8">
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <Grid.ColumnDefinitions><ColumnDefinition Width="110"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
           <TextBlock Text="PFX file:" VerticalAlignment="Center"/>
           <TextBox x:Name="PfxPathBox" Grid.Column="1" Margin="4"/>
           <Button x:Name="BrowseButton" Grid.Column="2" Content="Browse..." Margin="4"/>
           <TextBlock Grid.Row="1" Text="PFX password:" VerticalAlignment="Center"/>
           <PasswordBox x:Name="PfxPasswordBox" Grid.Row="1" Grid.Column="1" Margin="4"/>
-          <Button x:Name="ValidateButton" Grid.Row="2" Grid.Column="1" HorizontalAlignment="Left" Margin="4"
-                  Content="Validate certificate against Exchange (read-only)"/>
-          <TextBox x:Name="ValidationBox" Grid.Row="3" Grid.ColumnSpan="3" Margin="0,8,0,0" IsReadOnly="True" FontFamily="Consolas"
+          <WrapPanel Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2">
+            <Button x:Name="ValidateButton" Margin="4" Content="Validate certificate against Exchange (read-only)"/>
+            <Button x:Name="LoadAcmeButton" Margin="4" Content="Load last Let's Encrypt/ACME certificate"/>
+          </WrapPanel>
+          <TextBlock Grid.Row="3" Text="Or installed:" VerticalAlignment="Center" ToolTip="Use a certificate that is already in Exchange / bound to IIS - no PFX needed"/>
+          <DockPanel Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,4,0,0">
+            <Button x:Name="UseInstalledButton" DockPanel.Dock="Right" Margin="4" Content="Use installed certificate"/>
+            <Button x:Name="RefreshInstalledButton" DockPanel.Dock="Right" Margin="4" Content="Refresh"/>
+            <ComboBox x:Name="InstalledCertCombo" Margin="4" FontFamily="Consolas"/>
+          </DockPanel>
+          <TextBox x:Name="ValidationBox" Grid.Row="4" Grid.ColumnSpan="3" Margin="0,8,0,0" IsReadOnly="True" FontFamily="Consolas"
                    VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" TextWrapping="NoWrap"/>
         </Grid>
       </TabItem>
@@ -2079,7 +2277,7 @@ function New-MainWindow {
     $script:ui = $map
 }
 
-$script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'ImportButton', 'EnableButton', 'ConnectorPreviewButton', 'ConnectorUpdateButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
+$script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'LoadAcmeButton', 'UseInstalledButton', 'RefreshInstalledButton', 'ImportButton', 'EnableButton', 'ConnectorPreviewButton', 'ConnectorUpdateButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
 'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeCfTestButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
@@ -2122,6 +2320,9 @@ function Register-UiEvents {
             if ($dlg.ShowDialog($script:Window)) { $script:ui.PfxPathBox.Text = $dlg.FileName }
         })
     $ui.PfxPathBox.Add_TextChanged({ Reset-Validation })
+    $ui.LoadAcmeButton.Add_Click({ Invoke-UiAction 'Load ACME certificate' { Invoke-LoadAcmeSaved } })
+    $ui.UseInstalledButton.Add_Click({ Invoke-UiAction 'Use installed certificate' { Invoke-UseInstalledCertificate } })
+    $ui.RefreshInstalledButton.Add_Click({ Invoke-UiAction 'Refresh installed certificates' { Update-InventoryAndInstalled } })
     $ui.PfxPasswordBox.Add_PasswordChanged({ Reset-Validation })
     $ui.ValidateButton.Add_Click({ Invoke-UiAction 'Validate' { Invoke-ValidatePfx } })
     $ui.ImportButton.Add_Click({ Invoke-UiAction 'Import' { Invoke-ImportCertificate } })
@@ -2153,7 +2354,7 @@ function Register-UiEvents {
     $ui.LeCleanupButton.Add_Click({ Invoke-UiAction 'Clean up' { Clear-LeChallenges } })
     $script:Window.Add_ContentRendered({
             Update-LeModuleStatus
-            if (Test-ExchangeAvailable) { Invoke-UiAction 'Load servers' { Update-ServerList; Update-Inventory; Invoke-LeAutoFill } }
+            if (Test-ExchangeAvailable) { Invoke-UiAction 'Load servers' { Update-ServerList; Update-Inventory; Update-InstalledCertList; Invoke-LeAutoFill } }
             else {
                 Write-Log 'Exchange cmdlets not available - only PFX checks will work. Run on an Exchange server.' ERROR
                 $script:ui.StatusText.Text = 'Exchange cmdlets NOT loaded - run on an Exchange server'

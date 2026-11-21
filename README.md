@@ -67,10 +67,18 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 |---|---|---|
 | **1. Servers & inventory** | Select the mailbox servers to work on (all are selected by default). Review the current certificates. | No |
 | **1b. Free certificate (ACME)** *(optional)* | Request a free certificate instead of bringing a PFX. See [Free certificates](#free-certificates-acme) below. When it is issued, the PFX is loaded into tab 2 and validated automatically. | Yes (unless Dry run) |
-| **2. New certificate (PFX)** | Browse to the PFX, enter its password and click **Validate**. Read the report. Missing host names and connectors that point to the old certificate appear as warnings. | No |
+| **2. New certificate** | Browse to the PFX, enter its password and click **Validate**. Read the report. Missing host names and connectors that point to the old certificate appear as warnings. If you don't have the PFX, there are two other ways to pick the certificate; see [Certificate already issued or installed](#certificate-already-issued-or-installed). | No |
 | **3. Import & enable** | **Step A**: import the PFX on all selected servers. **Step B**: enable it for IIS and SMTP. **Step C**: update the SMTP connectors (see [SMTP connectors](#smtp-connectors-default-frontend)). The old certificate stays on the servers. | Yes |
 | **4. Verify** | Checks that Exchange has the new certificate enabled for IIS and SMTP and that it is served on port 443. You can add extra endpoints, such as `mail.contoso.com` or a load balancer address, to check too. | No |
 | **5. Remove old certificate** *(optional)* | Click **Load candidates**. The `Blockers` column shows why a certificate can't be removed yet. Select the rows to remove and confirm. | Yes |
+
+## Certificate already issued or installed
+
+If you closed the tool after issuing or enabling a certificate, for example before you knew about Step C, you don't need to request it again. Tab 2 has two ways to pick it up:
+
+- **Load last Let's Encrypt/ACME certificate** finds the certificates Posh-ACME saved for the current Windows user, in `%LOCALAPPDATA%\Posh-ACME\…\fullchain.pfx` (or `POSHACME_HOME` if set). It loads the newest one with its saved PFX password and validates it. The log lists all the certificates it found, newest first.
+- **Or installed → Use installed certificate** uses a certificate that is **already in Exchange**. The list contains every CA-issued certificate on the selected servers, with the one bound to IIS and expiring last at the top. No PFX is needed. You can then run Step B or Step C on tab 3, **Verify** on tab 4 and **Remove old** on tab 5 as usual.
+  - If the certificate is installed on only some of the servers, **Step A** copies it to the others. It does this with `Export-ExchangeCertificate` from a server where the private key is **exportable**. If the key isn't exportable, which is the default, Step A says so, and you need the original PFX: use **Load last Let's Encrypt/ACME certificate**, or tick *Mark private key as exportable* the next time you import.
 
 ## SMTP connectors (Default Frontend)
 
