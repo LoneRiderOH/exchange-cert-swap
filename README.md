@@ -76,10 +76,10 @@ After step 3, update any connectors reported on tab 2 with the command the tool 
 
 ![Let's Encrypt tab](docs/letsencrypt.png)
 
-1. Click **Install Posh-ACME** if the module is missing. It installs for the current user from the PowerShell Gallery.
+1. Click **Install Posh-ACME** if the module is missing. It installs for the current user from the PowerShell Gallery. The tool looks for the module on `PSModulePath` and also in the PowerShell 7 module folders, your Documents folders (including OneDrive and redirected Documents), Program Files, and a `Modules` folder next to the script. It then loads the module by its full path. If it still shows **NOT found**, the log lists every folder it checked. Click **Re-check** after installing it in another window.
 2. Keep **Environment = Staging** for the first run. Staging uses the full validation process but issues an untrusted certificate. The tool refuses to import staging certificates.
 3. Tick the Subscriber Agreement. The e-mail address is optional.
-4. Click **Fill from Exchange URLs** to take the public host names from the virtual directories and the Autodiscover names that exist in public DNS. Internal names such as `.local` are skipped. Edit the list if needed.
+4. Check the **names**. When the tool starts, it fills them in from the CA-issued certificate currently bound to IIS on the selected servers: the subject CN comes first, then the SANs. If the servers use different certificates, their names are combined. If a name is a wildcard, the tool switches to DNS-01. If IIS only has a self-signed certificate, it uses the Exchange URLs instead. The tool never overwrites names you typed. To refill the list, use **Fill from current certificate** or **Fill from Exchange URLs**. Internal names such as `.local`, plain server names and IP addresses are always skipped.
 5. Choose a challenge type:
 
    | Challenge | Use when | Notes |
@@ -104,6 +104,7 @@ Posh-ACME keeps the account, the orders and the issued files in `%LOCALAPPDATA%\
 - **Internal names such as `.local`**: public CAs can't issue certificates for them. Change the `InternalUrl` values to a public name that is on the certificate, and use split DNS. The tool lists these names during validation.
 - **Load balancers or reverse proxies that terminate TLS** (HAProxy, F5, KEMP, NGINX and so on) need the new certificate installed on them separately. Add their address on tab 4 to check it.
 - **Hybrid deployments**: if your *Outbound to Office 365* connector or the receive connectors point to the old certificate, update them before removing it, and rerun the Hybrid Configuration Wizard if your process requires it.
+- **Posh-ACME shows "NOT found" although you installed it**: check the folder list in the log. Common causes are installing it from PowerShell 7 (`pwsh`) as a *different* user than the one running the tool, or a server with no internet access. For offline servers, run `Save-Module Posh-ACME -Path .\Modules` on another machine and copy the `Modules` folder next to `ExchangeCertTool.ps1`. If loading fails because of the execution policy, the log shows the policy that applies.
 - **Let's Encrypt HTTP-01 fails with 403**: *Require SSL* is set on the root of *Default Web Site*. Use DNS-01, or allow HTTP for `/.well-known/acme-challenge` only.
 - The **Exchange Back End** site (port 444) and the **Auth certificate** are never changed by this tool.
 

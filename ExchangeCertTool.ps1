@@ -813,27 +813,76 @@ $script:LeWebConfig = @'
 </configuration>
 '@
 
-function Test-PoshAcme { [bool](Get-Command New-PAOrder -ErrorAction SilentlyContinue) -or [bool](Get-Module -ListAvailable -Name Posh-ACME) }
+# Folders searched for Posh-ACME in addition to $env:PSModulePath. Windows PowerShell 5.1 does not see
+# modules installed from PowerShell 7 (Documents\PowerShell\Modules), and a user-level PSModulePath
+# environment variable or redirected Documents folder can hide the normal CurrentUser path.
+function Get-PoshAcmeSearchRoots {
+    $docs = @([Environment]::GetFolderPath('MyDocuments'), (Join-Path $env:USERPROFILE 'Documents'))
+    if ($env:OneDrive) { $docs += (Join-Path $env:OneDrive 'Documents') }
+    $roots = @(Join-Path $PSScriptRoot 'Modules')   # portable copy: Save-Module Posh-ACME -Path .\Modules
+    foreach ($d in ($docs | Where-Object { $_ } | Select-Object -Unique)) {
+        $roots += (Join-Path $d 'WindowsPowerShell\Modules')
+        $roots += (Join-Path $d 'PowerShell\Modules')
+    }
+    $roots += (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules')
+    $roots += (Join-Path $env:ProgramFiles 'PowerShell\Modules')
+    $roots += @($env:PSModulePath -split ';' | Where-Object { $_ })
+    @($roots | Where-Object { $_ } | Select-Object -Unique)
+}
+
+# Returns the path of the newest Posh-ACME.psd1 found, or $null.
+function Find-PoshAcmeManifest {
+    $found = New-Object System.Collections.Generic.List[object]
+    foreach ($root in Get-PoshAcmeSearchRoots) {
+        $dir = Join-Path $root 'Posh-ACME'
+        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+        foreach ($psd in @(Get-ChildItem -LiteralPath $dir -Filter 'Posh-ACME.psd1' -Recurse -Depth 1 -File -ErrorAction SilentlyContinue)) {
+            $ver = [version]'0.0'
+            try { $ver = [version](Import-PowerShellDataFile -LiteralPath $psd.FullName).ModuleVersion } catch { }
+            $found.Add([pscustomobject]@{ Path = $psd.FullName; Version = $ver })
+        }
+    }
+    $best = $found | Sort-Object Version -Descending | Select-Object -First 1
+    if ($best) { return $best.Path }
+    return $null
+}
+
+function Test-PoshAcme { [bool](Get-Command New-PAOrder -ErrorAction SilentlyContinue) -or [bool](Find-PoshAcmeManifest) }
+
+function Write-PoshAcmeDiagnostics {
+    Write-Log "Posh-ACME not found for $env:USERDOMAIN\$env:USERNAME (PowerShell $($PSVersionTable.PSVersion), $([IntPtr]::Size * 8)-bit). Searched:" WARN
+    foreach ($r in Get-PoshAcmeSearchRoots) { Write-Log ("    {0}  {1}" -f $(if (Test-Path -LiteralPath $r) { '[exists] ' } else { '[missing]' }), $r) }
+    Write-Log 'Install it in WINDOWS PowerShell (powershell.exe, not pwsh) as the same user that runs this tool: Install-Module Posh-ACME -Scope CurrentUser. Offline: Save-Module Posh-ACME -Path <tool folder>\Modules on another machine and copy the folder.' WARN
+}
 
 function Import-PoshAcme {
     if (Get-Command New-PAOrder -ErrorAction SilentlyContinue) { return }
-    if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
-        throw 'The Posh-ACME module is not installed. Click "Install Posh-ACME" or run: Install-Module Posh-ACME -Scope CurrentUser'
+    $psd = Find-PoshAcmeManifest
+    if (-not $psd) {
+        Write-PoshAcmeDiagnostics
+        throw 'The Posh-ACME module was not found. Click "Install Posh-ACME" (see the log for the folders searched).'
     }
-    Import-Module Posh-ACME -ErrorAction Stop
-    Write-Log "Loaded Posh-ACME $((Get-Module Posh-ACME).Version)."
+    try { Import-Module $psd -Force -ErrorAction Stop }
+    catch {
+        $policy = (Get-ExecutionPolicy -List | Where-Object { "$($_.ExecutionPolicy)" -ne 'Undefined' } | ForEach-Object { "$($_.Scope)=$($_.ExecutionPolicy)" }) -join ', '
+        throw "Posh-ACME was found at $psd but could not be loaded: $($_.Exception.Message)  [Execution policy: $policy. If the files were copied from another machine, run: Get-ChildItem '$(Split-Path $psd)' -Recurse | Unblock-File]"
+    }
+    $onPath = [bool](Get-Module -ListAvailable -Name Posh-ACME)
+    Write-Log "Loaded Posh-ACME $((Get-Module Posh-ACME).Version) from $psd$(if (-not $onPath) { ' (not on PSModulePath - loaded by full path)' })."
 }
 
 function Update-LeModuleStatus {
     if (-not (Test-PoshAcme)) {
-        $script:ui.LeModuleText.Text = 'Posh-ACME: NOT installed (needed for Let''s Encrypt).'
+        $script:ui.LeModuleText.Text = 'Posh-ACME: NOT found (needed for Let''s Encrypt). See the log for the folders searched.'
         $script:ui.LeModuleText.Foreground = [System.Windows.Media.Brushes]::Firebrick
+        Write-PoshAcmeDiagnostics
         return
     }
     try {
         Import-PoshAcme
         $v = (Get-Module Posh-ACME).Version
         $script:ui.LeModuleText.Text = "Posh-ACME: installed$(if ($v) { " ($v)" })."
+        $script:ui.LeModuleText.ToolTip = (Get-Module Posh-ACME).ModuleBase
         $script:ui.LeModuleText.Foreground = [System.Windows.Media.Brushes]::DarkGreen
         $current = $script:ui.LePluginCombo.Text
         $script:ui.LePluginCombo.Items.Clear()
@@ -842,11 +891,16 @@ function Update-LeModuleStatus {
         }
         if ($current) { $script:ui.LePluginCombo.Text = $current }
     }
-    catch { Write-Log "Posh-ACME check failed: $($_.Exception.Message)" WARN }
+    catch {
+        $script:ui.LeModuleText.Text = 'Posh-ACME: found, but it could not be loaded - see the log.'
+        $script:ui.LeModuleText.Foreground = [System.Windows.Media.Brushes]::Firebrick
+        Write-Log "Posh-ACME check failed: $($_.Exception.Message)" ERROR
+    }
 }
 
 function Install-PoshAcme {
-    if (Get-Module -ListAvailable -Name Posh-ACME) { Write-Log 'Posh-ACME is already installed.' OK; Update-LeModuleStatus; return }
+    $existing = Find-PoshAcmeManifest
+    if ($existing) { Write-Log "Posh-ACME is already installed: $existing" OK; Update-LeModuleStatus; return }
     $msg = "Install the Posh-ACME module from the PowerShell Gallery for the current user ($env:USERNAME) on $env:COMPUTERNAME?`n`nNeeds internet access to www.powershellgallery.com."
     if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
     if (-not (Confirm-Action $msg 'Install Posh-ACME')) { Write-Log 'Install cancelled.' WARN; return }
@@ -855,8 +909,9 @@ function Install-PoshAcme {
         $nuget = Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue |
             Where-Object { $_.Version -ge [version]'2.8.5.201' }
         if (-not $nuget) { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null }
-        Install-Module Posh-ACME -Scope CurrentUser -Repository PSGallery -Force -AllowClobber
-        Write-Log 'Posh-ACME installed.' OK
+        Install-Module Posh-ACME -Scope CurrentUser -Repository PSGallery -Force -AllowClobber -ErrorAction Stop
+        $installed = @(Get-InstalledModule Posh-ACME -ErrorAction SilentlyContinue | Select-Object -First 1)
+        Write-Log "Posh-ACME installed$(if ($installed) { ": $($installed[0].Version) in $($installed[0].InstalledLocation)" })." OK
     }
     Update-LeModuleStatus
 }
@@ -897,13 +952,78 @@ function Get-LePublicAddress {
     ($(if ($cname) { "CNAME $cname -> " } else { '' })) + ($ips -join ', ')
 }
 
+$script:LeInternalNamePattern = '\.(local|lan|internal|corp|intra|localdomain|home|private)$'
+
+# The CA-issued certificate(s) currently bound to IIS on the selected servers, from the inventory.
+function Get-CurrentIisCertificates {
+    Assert-Exchange
+    $servers = Get-SelectedServers
+    if (-not $servers) { throw 'Select at least one server on tab 1.' }
+    if (-not $script:State.Inventory) { Update-Inventory }
+    $rows = @($script:State.Inventory | Where-Object {
+            $servers -contains $_.Server -and $_.SelfSigned -ne 'True' -and (($_.Services -split ',') -contains 'IIS') })
+    foreach ($g in ($rows | Group-Object Thumbprint | Sort-Object @{ e = { $_.Count }; Descending = $true }, @{ e = { $_.Group[0].NotAfter }; Descending = $true })) {
+        $r = $g.Group[0]
+        [pscustomobject]@{
+            Thumbprint = $r.Thumbprint; Subject = $r.Subject; NotAfter = $r.NotAfter; Issuer = $r.Issuer
+            Servers    = @($g.Group | ForEach-Object { $_.Server })
+            Domains    = @("$($r.Domains)" -split '\s*,\s*' | Where-Object { $_ })
+        }
+    }
+}
+
+function Set-LeNamesFromCurrentCert {
+    param([switch]$Auto)
+    $certs = @(Get-CurrentIisCertificates)
+    if (-not $certs) {
+        $m = 'No CA-issued certificate is bound to IIS on the selected servers (only self-signed).'
+        if ($Auto) { Write-Log "$m Names not filled from a certificate." ; return $false }
+        throw "$m Use ""Fill from Exchange URLs"" instead."
+    }
+    $names = New-Object System.Collections.Generic.List[string]
+    $skipped = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $certs) {
+        $cn = if ("$($c.Subject)" -match '(?:^|,\s*)CN=([^,]+)') { $Matches[1].Trim() } else { $null }
+        foreach ($n in @($cn) + $c.Domains) {
+            if (-not $n) { continue }
+            $n = $n.Trim().TrimEnd('.').ToLowerInvariant()
+            if ($n -match $script:LeInternalNamePattern -or $n -notmatch '\.' -or $n -match '^[\d.]+$') { if (-not $skipped.Contains($n)) { $skipped.Add($n) }; continue }
+            if (-not $names.Contains($n)) { $names.Add($n) }
+        }
+        Write-Log ("Current IIS certificate on {0}: {1} {2}, expires {3:yyyy-MM-dd}, issuer {4}" -f ($c.Servers -join ', '), $c.Thumbprint, $c.Subject, $c.NotAfter, $c.Issuer)
+    }
+    if ($certs.Count -gt 1) { Write-Log "The selected servers use $($certs.Count) different certificates - the names of all of them were combined." WARN }
+    foreach ($s in $skipped) { Write-Log "Skipping $s (internal name or IP - Let's Encrypt cannot issue for it)." WARN }
+    if (-not $names.Count) {
+        if ($Auto) { Write-Log 'The current certificate has no public names usable for Let''s Encrypt.' WARN; return $false }
+        throw 'The current certificate has no public names usable for Let''s Encrypt.'
+    }
+    $script:ui.LeNamesBox.Text = ($names -join "`r`n")
+    if (($names -match '^\*') -and $script:ui.LeHttpRadio.IsChecked) {
+        $script:ui.LeDnsManualRadio.IsChecked = $true
+        Write-Log 'The current certificate contains a wildcard name - switched the challenge type to DNS-01 (HTTP-01 cannot validate wildcards).' WARN
+    }
+    Write-Log "Filled $($names.Count) name(s) from the current certificate. Review the list before requesting." OK
+    return $true
+}
+
+# Called after the inventory loads: fill the names only if the box is still empty.
+function Invoke-LeAutoFill {
+    if ($script:ui.LeNamesBox.Text.Trim()) { return }
+    try {
+        if (Set-LeNamesFromCurrentCert -Auto) { return }
+        Set-LeNamesFromExchange
+    }
+    catch { Write-Log "Could not pre-fill Let's Encrypt names: $($_.Exception.Message)" WARN }
+}
+
 function Set-LeNamesFromExchange {
     Assert-Exchange
     $servers = Get-SelectedServers
     if (-not $servers) { throw 'Select at least one server on tab 1.' }
     $hosts = New-Object System.Collections.Generic.List[string]
     foreach ($h in @(Get-ExchangeHostNames -Servers $servers | Select-Object -ExpandProperty Host -Unique)) {
-        if ($h -match '\.(local|lan|internal|corp|intra|localdomain|home|private)$' -or $h -notmatch '\.') {
+        if ($h -match $script:LeInternalNamePattern -or $h -notmatch '\.') {
             Write-Log "Skipping internal name $h (Let's Encrypt cannot issue for it)." WARN; continue
         }
         if (-not $hosts.Contains($h)) { $hosts.Add($h) }
@@ -1386,6 +1506,7 @@ function Show-LePluginParams {
               <TextBlock TextWrapping="Wrap" Foreground="DimGray"
                          Text="Gets a free certificate from Let's Encrypt (via the Posh-ACME module) and hands the PFX to tab 2. Try Staging first: it proves the challenge works without hitting rate limits. Staging certificates are untrusted and cannot be imported."/>
               <DockPanel Margin="0,8,0,0">
+                <Button x:Name="LeRecheckModuleButton" DockPanel.Dock="Right" Content="Re-check" Margin="6,0,0,0"/>
                 <Button x:Name="LeInstallModuleButton" DockPanel.Dock="Right" Content="Install Posh-ACME" Margin="8,0,0,0"/>
                 <TextBlock x:Name="LeModuleText" VerticalAlignment="Center" TextWrapping="Wrap" Text="Posh-ACME: checking..."/>
               </DockPanel>
@@ -1397,11 +1518,13 @@ function Show-LePluginParams {
               <TextBlock Margin="0,8,0,2" Text="Contact e-mail for the ACME account (optional):"/>
               <TextBox x:Name="LeEmailBox"/>
               <CheckBox x:Name="LeTosCheck" Margin="0,6,0,0" Content="I accept the Let's Encrypt Subscriber Agreement"/>
-              <DockPanel Margin="0,10,0,2">
-                <Button x:Name="LeFillNamesButton" DockPanel.Dock="Right" Content="Fill from Exchange URLs" Margin="8,0,0,0"/>
-                <TextBlock VerticalAlignment="Bottom" TextWrapping="Wrap" Text="Names (one per line, first = subject):"/>
-              </DockPanel>
+              <TextBlock Margin="0,10,0,2" TextWrapping="Wrap"
+                         Text="Names (one per line, first = subject). Pre-filled from the certificate currently on IIS:"/>
               <TextBox x:Name="LeNamesBox" Height="90" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" FontFamily="Consolas"/>
+              <WrapPanel Margin="0,4,0,0">
+                <Button x:Name="LeFillCertButton" Content="Fill from current certificate" Margin="0,0,8,0"/>
+                <Button x:Name="LeFillNamesButton" Content="Fill from Exchange URLs"/>
+              </WrapPanel>
               <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                 <TextBlock Text="RSA key size:" VerticalAlignment="Center" Margin="0,0,8,0"/>
                 <ComboBox x:Name="LeKeyCombo" SelectedIndex="0" Width="90">
@@ -1517,7 +1640,7 @@ function New-MainWindow {
 }
 
 $script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'ImportButton', 'EnableButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
-'LeInstallModuleButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
+'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
     param([string]$Name, [scriptblock]$Body)
@@ -1568,6 +1691,8 @@ function Register-UiEvents {
     $ui.RemoveButton.Add_Click({ Invoke-UiAction 'Remove' { Invoke-RemoveOld } })
     $ui.LeInstallModuleButton.Add_Click({ Invoke-UiAction 'Install Posh-ACME' { Install-PoshAcme } })
     $ui.LeFillNamesButton.Add_Click({ Invoke-UiAction 'Fill names' { Set-LeNamesFromExchange } })
+    $ui.LeFillCertButton.Add_Click({ Invoke-UiAction 'Fill from certificate' { [void](Set-LeNamesFromCurrentCert) } })
+    $ui.LeRecheckModuleButton.Add_Click({ Invoke-UiAction 'Re-check Posh-ACME' { Update-LeModuleStatus } })
     $ui.LePluginParamsButton.Add_Click({ Invoke-UiAction 'Plugin parameters' { Show-LePluginParams } })
     $ui.LeTestHttpButton.Add_Click({ Invoke-UiAction 'HTTP-01 test' { Test-LeHttpSetup } })
     $ui.LeRequestButton.Add_Click({ Invoke-UiAction "Let's Encrypt request" { Start-LeRequest } })
@@ -1578,7 +1703,7 @@ function Register-UiEvents {
     $ui.LeCleanupButton.Add_Click({ Invoke-UiAction 'Clean up' { Clear-LeChallenges } })
     $script:Window.Add_ContentRendered({
             Update-LeModuleStatus
-            if (Test-ExchangeAvailable) { Invoke-UiAction 'Load servers' { Update-ServerList; Update-Inventory } }
+            if (Test-ExchangeAvailable) { Invoke-UiAction 'Load servers' { Update-ServerList; Update-Inventory; Invoke-LeAutoFill } }
             else {
                 Write-Log 'Exchange cmdlets not available - only PFX checks will work. Run on an Exchange server.' ERROR
                 $script:ui.StatusText.Text = 'Exchange cmdlets NOT loaded - run on an Exchange server'
