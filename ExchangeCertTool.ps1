@@ -12,6 +12,8 @@
 
     Workflow (one tab per step):
       1. Servers & inventory  - read-only: lists mailbox servers and every Exchange certificate.
+      1b. Let's Encrypt       - optional: requests a certificate (HTTP-01 or DNS-01) with the
+                                Posh-ACME module and loads the resulting PFX into tab 2.
       2. New certificate      - read-only: opens the PFX, checks key/expiry/EKU/chain, checks that
                                 every Exchange URL host name is covered, reports connectors that
                                 pin the old certificate via TlsCertificateName.
@@ -467,6 +469,7 @@ function Invoke-ValidatePfx {
     & $out "SAN names   : $($sanNames -join ', ')"
     & $out ''
 
+    if ($leaf.Issuer -match '\(STAGING\)|Fake LE|Pebble') { $errors.Add('This is a Let''s Encrypt STAGING/test certificate - clients do not trust it. Request it again with Environment = Production.') }
     if ($leaf.NotAfter -lt (Get-Date)) { $errors.Add('Certificate is EXPIRED.') }
     elseif ($leaf.NotBefore -gt (Get-Date)) { $errors.Add("Certificate is not valid yet (NotBefore $($leaf.NotBefore)).") }
     elseif ($daysLeft -lt 30) { $warnings.Add("Certificate expires in $daysLeft days.") }
@@ -781,6 +784,556 @@ function Invoke-RemoveOld {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Let's Encrypt (ACME) via the Posh-ACME module - tab "1b"
+# ---------------------------------------------------------------------------------------------
+$script:Le = @{
+    Mode       = $null      # 'HTTP' | 'DNSManual' | 'DNSPlugin'
+    Plugin     = $null
+    PluginArgs = $null
+    Challenges = @()        # pending challenge objects (see New-LeChallenge)
+    Names      = @()
+}
+$script:LeHttpPort = 80
+$script:LeDnsResolvers = @('1.1.1.1', '8.8.8.8')
+$script:LeWebConfig = @'
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Created by ExchangeCertTool for Let's Encrypt HTTP-01 validation. Safe to delete. -->
+<configuration>
+  <system.webServer>
+    <httpRedirect enabled="false" />
+    <staticContent>
+      <clear />
+      <mimeMap fileExtension="." mimeType="text/plain" />
+    </staticContent>
+    <handlers>
+      <clear />
+      <add name="StaticFile" path="*" verb="GET,HEAD" modules="StaticFileModule" resourceType="Either" requireAccess="Read" />
+    </handlers>
+  </system.webServer>
+</configuration>
+'@
+
+function Test-PoshAcme { [bool](Get-Command New-PAOrder -ErrorAction SilentlyContinue) -or [bool](Get-Module -ListAvailable -Name Posh-ACME) }
+
+function Import-PoshAcme {
+    if (Get-Command New-PAOrder -ErrorAction SilentlyContinue) { return }
+    if (-not (Get-Module -ListAvailable -Name Posh-ACME)) {
+        throw 'The Posh-ACME module is not installed. Click "Install Posh-ACME" or run: Install-Module Posh-ACME -Scope CurrentUser'
+    }
+    Import-Module Posh-ACME -ErrorAction Stop
+    Write-Log "Loaded Posh-ACME $((Get-Module Posh-ACME).Version)."
+}
+
+function Update-LeModuleStatus {
+    if (-not (Test-PoshAcme)) {
+        $script:ui.LeModuleText.Text = 'Posh-ACME: NOT installed (needed for Let''s Encrypt).'
+        $script:ui.LeModuleText.Foreground = [System.Windows.Media.Brushes]::Firebrick
+        return
+    }
+    try {
+        Import-PoshAcme
+        $v = (Get-Module Posh-ACME).Version
+        $script:ui.LeModuleText.Text = "Posh-ACME: installed$(if ($v) { " ($v)" })."
+        $script:ui.LeModuleText.Foreground = [System.Windows.Media.Brushes]::DarkGreen
+        $current = $script:ui.LePluginCombo.Text
+        $script:ui.LePluginCombo.Items.Clear()
+        foreach ($p in @(Get-PAPlugin | Where-Object { "$($_.ChallengeType)" -eq 'dns-01' -and $_.Name -ne 'Manual' } | Sort-Object Name)) {
+            [void]$script:ui.LePluginCombo.Items.Add("$($p.Name)")
+        }
+        if ($current) { $script:ui.LePluginCombo.Text = $current }
+    }
+    catch { Write-Log "Posh-ACME check failed: $($_.Exception.Message)" WARN }
+}
+
+function Install-PoshAcme {
+    if (Get-Module -ListAvailable -Name Posh-ACME) { Write-Log 'Posh-ACME is already installed.' OK; Update-LeModuleStatus; return }
+    $msg = "Install the Posh-ACME module from the PowerShell Gallery for the current user ($env:USERNAME) on $env:COMPUTERNAME?`n`nNeeds internet access to www.powershellgallery.com."
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+    if (-not (Confirm-Action $msg 'Install Posh-ACME')) { Write-Log 'Install cancelled.' WARN; return }
+    Invoke-Step 'Install-Module Posh-ACME -Scope CurrentUser -Repository PSGallery' {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $nuget = Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue |
+            Where-Object { $_.Version -ge [version]'2.8.5.201' }
+        if (-not $nuget) { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null }
+        Install-Module Posh-ACME -Scope CurrentUser -Repository PSGallery -Force -AllowClobber
+        Write-Log 'Posh-ACME installed.' OK
+    }
+    Update-LeModuleStatus
+}
+
+function Get-LeMode {
+    if ($script:ui.LeDnsManualRadio.IsChecked) { return 'DNSManual' }
+    if ($script:ui.LeDnsPluginRadio.IsChecked) { return 'DNSPlugin' }
+    return 'HTTP'
+}
+
+function Get-LeNames {
+    $names = @($script:ui.LeNamesBox.Text -split '[\r\n,;\s]+' |
+        ForEach-Object { $_.Trim().TrimEnd('.').ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
+    if (-not $names) { throw 'Enter at least one name for the certificate.' }
+    foreach ($n in $names) {
+        if ($n -notmatch '^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$') { throw "Not a valid DNS name: $n" }
+        if ($n -match '\.(local|lan|internal|corp|intra|localdomain|home|private)$') { throw "Let's Encrypt cannot issue certificates for internal names: $n" }
+    }
+    if ($names.Count -gt 100) { throw "Let's Encrypt allows at most 100 names per certificate (you have $($names.Count))." }
+    $names
+}
+
+function Resolve-PublicName {
+    param([Parameter(Mandatory)][string]$Name, [string]$Type = 'A')
+    foreach ($srv in $script:LeDnsResolvers) {
+        try { return @(Resolve-DnsName -Name $Name -Type $Type -Server $srv -DnsOnly -QuickTimeout -ErrorAction Stop) }
+        catch { }
+    }
+    return @()
+}
+
+function Get-LePublicAddress {
+    param([string]$Name)
+    $r = @(Resolve-PublicName -Name $Name -Type A)
+    $ips = @($r | Where-Object { $_.Type -eq 'A' } | ForEach-Object { "$($_.IPAddress)" })
+    $cname = @($r | Where-Object { $_.Type -eq 'CNAME' } | ForEach-Object { "$($_.NameHost)" }) | Select-Object -First 1
+    if (-not $ips) { return 'NOT in public DNS' }
+    ($(if ($cname) { "CNAME $cname -> " } else { '' })) + ($ips -join ', ')
+}
+
+function Set-LeNamesFromExchange {
+    Assert-Exchange
+    $servers = Get-SelectedServers
+    if (-not $servers) { throw 'Select at least one server on tab 1.' }
+    $hosts = New-Object System.Collections.Generic.List[string]
+    foreach ($h in @(Get-ExchangeHostNames -Servers $servers | Select-Object -ExpandProperty Host -Unique)) {
+        if ($h -match '\.(local|lan|internal|corp|intra|localdomain|home|private)$' -or $h -notmatch '\.') {
+            Write-Log "Skipping internal name $h (Let's Encrypt cannot issue for it)." WARN; continue
+        }
+        if (-not $hosts.Contains($h)) { $hosts.Add($h) }
+    }
+    try {
+        foreach ($d in @(Get-AcceptedDomain)) {
+            $ad = "autodiscover.$($d.DomainName)".ToLowerInvariant()
+            if ($ad -match '\*' -or $hosts.Contains($ad)) { continue }
+            if (@(Resolve-PublicName -Name $ad -Type A | Where-Object { $_.Type -in 'A', 'CNAME' }).Count) { $hosts.Add($ad) }
+            else { Write-Log "$ad has no public DNS record - not added." }
+        }
+    }
+    catch { Write-Log "Get-AcceptedDomain failed: $($_.Exception.Message)" WARN }
+    if (-not $hosts.Count) { throw 'No public host names found on the Exchange virtual directories.' }
+    $script:ui.LeNamesBox.Text = ($hosts -join "`r`n")
+    foreach ($h in $hosts) { Write-Log ("  {0,-35} public DNS: {1}" -f $h, (Get-LePublicAddress $h)) }
+    Write-Log "Filled $($hosts.Count) name(s) from Exchange URLs. Review the list before requesting." OK
+}
+
+function ConvertFrom-LePluginArgs {
+    param([string]$Text)
+    $h = @{}
+    foreach ($line in ($Text -split "`r?`n")) {
+        $l = $line.Trim()
+        if (-not $l -or $l.StartsWith('#')) { continue }
+        if ($l -notmatch '^([A-Za-z][A-Za-z0-9_]*)\s*=\s*(.*)$') { throw "Plugin argument lines must look like Name=Value (problem: '$($l.Split('=')[0])')." }
+        $n = $Matches[1]; $v = $Matches[2].Trim()
+        if ($v -match '^secure:(.*)$') { $h[$n] = ConvertTo-SecureString $Matches[1] -AsPlainText -Force }
+        elseif ($v -match '^(?i:true|false)$') { $h[$n] = [bool]::Parse($v) }
+        elseif ($v -match '^\[(.*)\]$') { $h[$n] = @($Matches[1] -split '\s*,\s*' | Where-Object { $_ }) }
+        else { $h[$n] = $v }
+    }
+    $h
+}
+
+function Get-LeWebroots {
+    $template = $script:ui.LeWebrootBox.Text.Trim()
+    if (-not $template) { throw 'Enter the webroot path for HTTP-01.' }
+    $servers = Get-SelectedServers
+    if (-not $servers) { throw 'Select the servers on tab 1. The challenge file goes to every selected server, because a load balancer can send Let''s Encrypt to any of them.' }
+    foreach ($s in $servers) {
+        $fqdn = if ($script:State.Servers.ContainsKey($s) -and $script:State.Servers[$s].Fqdn) { $script:State.Servers[$s].Fqdn } else { $s }
+        [pscustomobject]@{ Server = $s; Fqdn = $fqdn; Root = (($template -replace '\{server\}', $s) -replace '\{fqdn\}', $fqdn) }
+    }
+}
+
+function Write-LeChallengeFile {
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$Content)
+    if (-not (Test-Path -LiteralPath $Root)) { throw "Webroot not reachable: $Root" }
+    $dir = Join-Path $Root '.well-known\acme-challenge'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $wc = Join-Path $dir 'web.config'
+    if (-not (Test-Path -LiteralPath $wc)) { [IO.File]::WriteAllText($wc, $script:LeWebConfig, $utf8) }
+    $file = Join-Path $dir $Token
+    [IO.File]::WriteAllText($file, $Content, $utf8)
+    $file
+}
+
+function Invoke-LeHttpProbe {
+    param([Parameter(Mandatory)][string]$Target, [Parameter(Mandatory)][string]$HostHeader, [Parameter(Mandatory)][string]$Token)
+    $url = 'http://{0}:{1}/.well-known/acme-challenge/{2}' -f $Target, $script:LeHttpPort, $Token
+    $req = [System.Net.HttpWebRequest]::Create($url)
+    $req.Host = $HostHeader
+    $req.AllowAutoRedirect = $false
+    $req.Timeout = 10000
+    $req.Proxy = $null
+    $resp = $null
+    try { $resp = $req.GetResponse() }
+    catch {
+        $ex = $_.Exception
+        while ($ex -and -not ($ex -is [System.Net.WebException])) { $ex = $ex.InnerException }
+        if ($ex -and $ex.Response) { $resp = $ex.Response }
+        else { return [pscustomobject]@{ Ok = $false; Status = 'no response'; Body = ''; Detail = $_.Exception.Message } }
+    }
+    try {
+        $code = [int]$resp.StatusCode
+        $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $body = $sr.ReadToEnd(); $sr.Close()
+        $loc = $resp.Headers['Location']
+        [pscustomobject]@{ Ok = ($code -eq 200); Status = $code; Body = $body.Trim(); Detail = $(if ($loc) { "redirects to $loc" } else { '' }) }
+    }
+    finally { $resp.Close() }
+}
+
+function Get-LeProbeHint {
+    param($Probe)
+    if ($Probe.Ok) { return '' }
+    switch -Regex ("$($Probe.Status)") {
+        '^30\d' { return 'IIS redirects this path; Let''s Encrypt follows redirects only to the same name on 80/443. Check HTTP Redirect on Default Web Site.' }
+        '^403' { return '"Require SSL" is probably set on Default Web Site - HTTP-01 needs plain HTTP on port 80.' }
+        '^404' { return 'File not served - is the webroot path the physical path of Default Web Site?' }
+        'no response' { return 'Port 80 not reachable from here (firewall, or IIS not listening on 80).' }
+        default { return '' }
+    }
+}
+
+function New-LeChallenge {
+    param($Auth, [string]$Type)
+    [pscustomobject]@{
+        Fqdn      = "$($Auth.fqdn)"
+        DnsId     = "$($Auth.DNSId)"
+        Type      = $Type
+        Token     = $(if ($Type -eq 'http-01') { "$($Auth.HTTP01Token)" } else { "$($Auth.DNS01Token)" })
+        Url       = $(if ($Type -eq 'http-01') { "$($Auth.HTTP01Url)" } else { "$($Auth.DNS01Url)" })
+        Record    = ''
+        Value     = ''
+        Files     = New-Object System.Collections.Generic.List[string]
+        Published = $false
+        Status    = 'pending'
+    }
+}
+
+function Show-LeChallenges {
+    $rows = foreach ($c in $script:Le.Challenges) {
+        [pscustomobject]@{
+            Name   = $c.Fqdn
+            Type   = $c.Type
+            Record = $(if ($c.Type -eq 'dns-01') { "$($c.Record)  (TXT)" } else { "http://$($c.DnsId)/.well-known/acme-challenge/$($c.Token)" })
+            Value  = $c.Value
+            Status = $c.Status
+        }
+    }
+    $script:ui.LeGrid.ItemsSource = (ConvertTo-DataTable @($rows) @('Name', 'Type', 'Record', 'Value', 'Status')).DefaultView
+    Update-Ui
+}
+
+function Wait-Ui {
+    param([double]$Seconds)
+    $end = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $end) { Update-Ui; Start-Sleep -Milliseconds 200 }
+}
+
+function Test-LeHttpSetup {
+    $names = @(Get-LeNames | Where-Object { $_ -notmatch '^\*' })
+    if (-not $names) { throw 'Only wildcard names entered - HTTP-01 cannot be used for wildcards.' }
+    $roots = @(Get-LeWebroots)
+    $token = 'certtool-test-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $content = 'ok-' + [guid]::NewGuid().ToString('N')
+    if (Test-DryRun) {
+        foreach ($r in $roots) { Write-Log "[DRY RUN] would write test file $($r.Root)\.well-known\acme-challenge\$token and request it via http://$($r.Fqdn)/ for each name" CMD }
+        Write-Log 'Untick Dry run to actually run the HTTP-01 test (it writes and then deletes a small text file).' INFO
+        return
+    }
+    $rows = New-Object System.Collections.Generic.List[object]
+    $files = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($r in $roots) {
+            try { $files.Add((Write-LeChallengeFile -Root $r.Root -Token $token -Content $content)); Write-Log "$($r.Server): wrote test file to $($r.Root)" }
+            catch { $rows.Add([pscustomobject]@{ Name = $r.Server; Type = 'write'; Record = $r.Root; Value = ''; Status = "FAIL: $($_.Exception.Message)" }) }
+        }
+        foreach ($r in $roots) {
+            foreach ($n in $names) {
+                $p = Invoke-LeHttpProbe -Target $r.Fqdn -HostHeader $n -Token $token
+                $ok = $p.Ok -and $p.Body -eq $content
+                $status = if ($ok) { 'PASS' } else { "FAIL ($($p.Status)) $($p.Detail) $(Get-LeProbeHint $p)".Trim() }
+                $rows.Add([pscustomobject]@{ Name = $n; Type = "via $($r.Server)"; Record = "http://$($r.Fqdn)/.well-known/acme-challenge/ (Host: $n)"; Value = ''; Status = $status })
+                Write-Log ("HTTP-01 test {0} via {1}: {2}" -f $n, $r.Server, $status) $(if ($ok) { 'OK' } else { 'WARN' })
+            }
+        }
+        foreach ($n in $names) {
+            $pub = Get-LePublicAddress $n
+            $rows.Add([pscustomobject]@{ Name = $n; Type = 'public DNS'; Record = $pub; Value = ''; Status = $(if ($pub -like 'NOT*') { 'FAIL - name must resolve publicly' } else { 'INFO - port 80 on this address must reach the Exchange servers' }) })
+        }
+    }
+    finally {
+        foreach ($f in $files) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        if ($files.Count) { Write-Log "Removed $($files.Count) test file(s)." }
+    }
+    $script:ui.LeGrid.ItemsSource = (ConvertTo-DataTable $rows.ToArray() @('Name', 'Type', 'Record', 'Value', 'Status')).DefaultView
+    $script:ui.LeStatusText.Text = 'HTTP-01 test done. This checks IIS on each server from inside your network; it cannot prove that port 80 from the internet reaches Exchange (check your firewall / load balancer).'
+}
+
+function Start-LeRequest {
+    $names = @(Get-LeNames)
+    $mode = Get-LeMode
+    if ($mode -eq 'HTTP' -and ($names -match '^\*')) { throw 'Wildcard names need DNS-01. Choose a DNS-01 option or remove the wildcard.' }
+    if (-not $script:ui.LeTosCheck.IsChecked) { throw 'Tick "I accept the Let''s Encrypt Subscriber Agreement" first.' }
+    if ($script:Le.Challenges.Count) { throw 'A previous request still has challenges in place. Click "Continue" or "Clean up challenges" first.' }
+    $email = $script:ui.LeEmailBox.Text.Trim()
+    if ($email -and $email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw "Not a valid e-mail address: $email" }
+    $prod = ($script:ui.LeEnvCombo.SelectedIndex -eq 1)
+    $acmeServer = if ($prod) { 'LE_PROD' } else { 'LE_STAGE' }
+    $keyLen = "$($script:ui.LeKeyCombo.SelectedItem.Content)"
+    $plugin = $null; $pluginArgs = $null; $roots = @()
+    if ($mode -eq 'DNSPlugin') {
+        $plugin = $script:ui.LePluginCombo.Text.Trim()
+        if (-not $plugin) { throw 'Choose a DNS plugin (e.g. Cloudflare, Route53, Azure).' }
+        $pluginArgs = ConvertFrom-LePluginArgs $script:ui.LePluginArgsBox.Text
+    }
+    if ($mode -eq 'HTTP') { $roots = @(Get-LeWebroots) }
+
+    $modeText = @{ HTTP = 'HTTP-01 (file in IIS)'; DNSManual = 'DNS-01 (you add TXT records)'; DNSPlugin = "DNS-01 via plugin $plugin" }[$mode]
+    $msg = "Request a certificate from Let's Encrypt $(if ($prod) { 'PRODUCTION' } else { 'STAGING (test, untrusted)' })`n`n" +
+    "Names:`n  $($names -join "`n  ")`n`nChallenge: $modeText`nKey: RSA $keyLen"
+    if ($mode -eq 'HTTP') { $msg += "`n`nChallenge files will be written to:`n  $(($roots | ForEach-Object { $_.Root }) -join "`n  ")" }
+    if ($prod) { $msg += "`n`nProduction has rate limits (5 identical certificates per week). Test with Staging first." }
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - Let's Encrypt is not contacted, nothing is written)" }
+    if (-not (Confirm-Action $msg "Let's Encrypt request")) { Write-Log 'Request cancelled.' WARN; return }
+
+    if (Test-DryRun) {
+        Write-Log "[DRY RUN] Set-PAServer $acmeServer" CMD
+        Write-Log "[DRY RUN] New-PAAccount -AcceptTOS$(if ($email) { " -Contact $email" }) (only if no account exists yet)" CMD
+        Write-Log "[DRY RUN] New-PAOrder -Domain $($names -join ',') -KeyLength $keyLen -PfxPass <random> -Force" CMD
+        switch ($mode) {
+            'HTTP' { foreach ($r in $roots) { Write-Log "[DRY RUN] write <token> + web.config to $($r.Root)\.well-known\acme-challenge\" CMD } }
+            'DNSManual' { Write-Log '[DRY RUN] show _acme-challenge TXT records for you to create, then wait for "Continue"' CMD }
+            'DNSPlugin' { Write-Log "[DRY RUN] Publish-Challenge/Save-Challenge -Plugin $plugin -PluginArgs <$(@($pluginArgs.Keys) -join ', ')>" CMD }
+        }
+        Write-Log '[DRY RUN] Send-ChallengeAck, wait for validation, Submit-OrderFinalize, Complete-PAOrder, remove challenges, load fullchain.pfx into tab 2' CMD
+        return
+    }
+
+    Import-PoshAcme
+    Write-Log "Set-PAServer $acmeServer" CMD
+    Set-PAServer $acmeServer
+    $acct = Get-PAAccount
+    if (-not $acct -or "$($acct.status)" -ne 'valid') {
+        Write-Log "New-PAAccount -AcceptTOS$(if ($email) { " -Contact $email" })" CMD
+        $acctArgs = @{ AcceptTOS = $true; Force = $true }
+        if ($email) { $acctArgs.Contact = $email }
+        $acct = New-PAAccount @acctArgs
+    }
+    Write-Log "ACME account: $($acct.id) ($acmeServer)"
+
+    Write-Log "New-PAOrder -Domain $($names -join ',') -KeyLength $keyLen -PfxPass <random> -Force" CMD
+    $order = New-PAOrder -Domain $names -KeyLength $keyLen -PfxPassSecure (New-RandomSecurePassword) -FriendlyName ("Exchange {0} {1:yyyy-MM-dd}" -f $names[0], (Get-Date)) -Force
+    Write-Log "Order $($order.Name) created, status $($order.status)."
+
+    $script:Le.Mode = $mode; $script:Le.Plugin = $plugin; $script:Le.PluginArgs = $pluginArgs; $script:Le.Names = $names
+    $challenges = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($a in @($order | Get-PAAuthorization)) {
+            if ("$($a.status)" -eq 'valid') { Write-Log "$($a.fqdn): already authorized (reused)." OK; continue }
+            if ("$($a.status)" -ne 'pending') { throw "Authorization for $($a.fqdn) is '$($a.status)'." }
+            if ($mode -eq 'HTTP') {
+                if (-not $a.HTTP01Token) { throw "Let's Encrypt offered no HTTP-01 challenge for $($a.fqdn)." }
+                $c = New-LeChallenge $a 'http-01'
+                $c.Value = Get-KeyAuthorization $c.Token
+                foreach ($r in $roots) {
+                    $c.Files.Add((Write-LeChallengeFile -Root $r.Root -Token $c.Token -Content $c.Value))
+                    Write-Log "$($c.Fqdn): challenge file written on $($r.Server)."
+                }
+                foreach ($r in $roots) {
+                    $p = Invoke-LeHttpProbe -Target $r.Fqdn -HostHeader $c.DnsId -Token $c.Token
+                    if ($p.Ok -and $p.Body -eq $c.Value) { Write-Log "$($c.Fqdn): served correctly by $($r.Server)." OK }
+                    else { Write-Log "$($c.Fqdn): NOT served correctly by $($r.Server) ($($p.Status) $($p.Detail)). $(Get-LeProbeHint $p)" WARN }
+                }
+            }
+            else {
+                if (-not $a.DNS01Token) { throw "Let's Encrypt offered no DNS-01 challenge for $($a.fqdn)." }
+                $c = New-LeChallenge $a 'dns-01'
+                $c.Record = "_acme-challenge.$($c.DnsId)"
+                $c.Value = Get-KeyAuthorization $c.Token -ForDNS
+                if ($mode -eq 'DNSPlugin') {
+                    Write-Log "Publish-Challenge $($c.DnsId) -Plugin $plugin" CMD
+                    Publish-Challenge -Domain $c.DnsId -Account $acct -Token $c.Token -Plugin $plugin -PluginArgs $pluginArgs
+                    $c.Published = $true
+                }
+            }
+            $challenges.Add($c)
+        }
+        $script:Le.Challenges = $challenges.ToArray()
+        if ($mode -eq 'DNSPlugin' -and $challenges.Count) {
+            Write-Log "Save-Challenge -Plugin $plugin" CMD
+            Save-Challenge -Plugin $plugin -PluginArgs $pluginArgs
+        }
+    }
+    catch {
+        $script:Le.Challenges = $challenges.ToArray()
+        Clear-LeChallenges
+        throw
+    }
+    Show-LeChallenges
+
+    if ($mode -eq 'DNSManual' -and $challenges.Count) {
+        $script:ui.LeStatusText.Text = 'Create these TXT records in your public DNS zone (one record per row; the same name can have two values). Then click "Check DNS records" and "Continue (records added)".'
+        Write-Log 'Waiting for you to add the TXT records shown in the grid, then click "Continue (records added)".' WARN
+        foreach ($c in $challenges) { Write-Log ("  TXT  {0}  =  {1}" -f $c.Record, $c.Value) }
+        return
+    }
+    Complete-LeRequest
+}
+
+function New-RandomSecurePassword {
+    $bytes = New-Object byte[] 24
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    ConvertTo-SecureString ([Convert]::ToBase64String($bytes) -replace '[+/=]', 'x') -AsPlainText -Force
+}
+
+function Test-LeDnsRecords {
+    param([switch]$Quiet)
+    $dns = @($script:Le.Challenges | Where-Object { $_.Type -eq 'dns-01' })
+    if (-not $dns) { if (-not $Quiet) { throw 'No pending DNS-01 challenges.' } return $true }
+    $all = $true
+    foreach ($c in $dns) {
+        $found = @()
+        foreach ($srv in $script:LeDnsResolvers) {
+            try { $found += @(Resolve-DnsName -Name $c.Record -Type TXT -Server $srv -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'TXT' } | ForEach-Object { $_.Strings -join '' }) }
+            catch { }
+        }
+        $ok = $found -contains $c.Value
+        $c.Status = if ($ok) { 'TXT visible' } elseif ($found) { 'TXT found, wrong value' } else { 'TXT not visible yet' }
+        if (-not $ok) { $all = $false }
+        if (-not $Quiet) { Write-Log ("{0}: {1}" -f $c.Record, $c.Status) $(if ($ok) { 'OK' } else { 'WARN' }) }
+    }
+    Show-LeChallenges
+    return $all
+}
+
+function Complete-LeRequest {
+    Import-PoshAcme
+    $order = Get-PAOrder -Refresh
+    if (-not $order) { throw 'No current Posh-ACME order. Click "Request certificate" first.' }
+    $pending = @($script:Le.Challenges)
+    if (-not $pending -and "$($order.status)" -eq 'pending') { throw 'No challenges are in place for the current order. Click "Request certificate" again.' }
+    $keepChallenges = $false
+    try {
+        if ($pending | Where-Object { $_.Type -eq 'dns-01' }) {
+            Write-Log 'Waiting for the TXT records to appear in public DNS (up to 5 minutes)...'
+            $deadline = (Get-Date).AddMinutes(5)
+            while (-not (Test-LeDnsRecords -Quiet)) {
+                if ((Get-Date) -gt $deadline) {
+                    if ($script:Le.Mode -eq 'DNSManual') { $keepChallenges = $true; throw 'TXT records are still not visible on public resolvers. Check them, then click "Continue" again.' }
+                    Write-Log 'TXT records not visible on public resolvers yet - asking Let''s Encrypt to validate anyway.' WARN
+                    break
+                }
+                Wait-Ui 10
+            }
+        }
+        foreach ($c in $pending) {
+            Write-Log "Send-ChallengeAck $($c.Fqdn) ($($c.Type))" CMD
+            Send-ChallengeAck -ChallengeUrl $c.Url
+            $c.Status = 'submitted'
+        }
+        Show-LeChallenges
+
+        $deadline = (Get-Date).AddMinutes(3)
+        while ($true) {
+            $auths = @($order | Get-PAAuthorization)
+            $bad = @($auths | Where-Object { "$($_.status)" -in 'invalid', 'deactivated', 'expired', 'revoked' })
+            foreach ($c in $pending) {
+                $a = $auths | Where-Object { "$($_.fqdn)" -eq $c.Fqdn } | Select-Object -First 1
+                if ($a) { $c.Status = "$($a.status)" }
+            }
+            Show-LeChallenges
+            if ($bad) {
+                $details = foreach ($b in $bad) {
+                    $err = @($b.challenges | Where-Object { $_.error } | ForEach-Object { $_.error.detail }) -join '; '
+                    "$($b.fqdn): $($b.status) - $err"
+                }
+                throw "Let's Encrypt validation failed:`n$($details -join "`n")"
+            }
+            if (-not @($auths | Where-Object { "$($_.status)" -ne 'valid' })) { break }
+            if ((Get-Date) -gt $deadline) { throw 'Timed out waiting for Let''s Encrypt to validate the challenges.' }
+            Wait-Ui 3
+        }
+        Write-Log 'All names validated.' OK
+
+        $order = Get-PAOrder -Refresh
+        $deadline = (Get-Date).AddMinutes(2)
+        while ("$($order.status)" -eq 'pending') {
+            if ((Get-Date) -gt $deadline) { throw 'Order did not become ready.' }
+            Wait-Ui 2; $order = Get-PAOrder -Refresh
+        }
+        if ("$($order.status)" -eq 'ready') {
+            Write-Log 'Submit-OrderFinalize' CMD
+            $order | Submit-OrderFinalize
+        }
+        $deadline = (Get-Date).AddMinutes(3)
+        $order = Get-PAOrder -Refresh
+        while ("$($order.status)" -ne 'valid') {
+            if ("$($order.status)" -eq 'invalid') { throw 'Order became invalid during finalization.' }
+            if ((Get-Date) -gt $deadline) { throw "Timed out waiting for the certificate (order status $($order.status))." }
+            Wait-Ui 3; $order = Get-PAOrder -Refresh
+        }
+        Write-Log 'Complete-PAOrder' CMD
+        $cert = $order | Complete-PAOrder
+        if (-not $cert -or -not $cert.PfxFullChain -or -not (Test-Path -LiteralPath $cert.PfxFullChain)) { throw 'Certificate issued, but fullchain.pfx was not found.' }
+        Write-Log ("Certificate issued: {0}, thumbprint {1}, expires {2:yyyy-MM-dd}." -f $cert.Subject, $cert.Thumbprint, $cert.NotAfter) OK
+        Write-Log "PFX: $($cert.PfxFullChain) (password kept by Posh-ACME: (Get-PAOrder '$($order.Name)').PfxPass)"
+    }
+    finally { if (-not $keepChallenges) { Clear-LeChallenges } }
+
+    $script:ui.PfxPathBox.Text = $cert.PfxFullChain
+    $script:ui.PfxPasswordBox.Password = (New-Object System.Net.NetworkCredential('', $cert.PfxPass)).Password
+    $script:ui.LeStatusText.Text = "Certificate issued. It was loaded into tab 2 and validated - continue there."
+    $script:ui.MainTabs.SelectedIndex = 2
+    Update-Ui
+    Invoke-ValidatePfx
+}
+
+function Clear-LeChallenges {
+    $list = @($script:Le.Challenges)
+    if (-not $list) { Write-Log 'No challenges to clean up.'; return }
+    $published = $false
+    foreach ($c in $list) {
+        foreach ($f in $c.Files) {
+            try { Remove-Item -LiteralPath $f -Force -ErrorAction Stop; Write-Log "Removed challenge file $f" }
+            catch { Write-Log "Could not remove $f : $($_.Exception.Message)" WARN }
+        }
+        if ($c.Type -eq 'dns-01' -and $c.Published -and $script:Le.Plugin) {
+            try {
+                Unpublish-Challenge -Domain $c.DnsId -Account (Get-PAAccount) -Token $c.Token -Plugin $script:Le.Plugin -PluginArgs $script:Le.PluginArgs
+                $published = $true
+            }
+            catch { Write-Log "Unpublish-Challenge $($c.DnsId) failed: $($_.Exception.Message)" WARN }
+        }
+        elseif ($c.Type -eq 'dns-01' -and $script:Le.Mode -eq 'DNSManual') {
+            Write-Log "You can delete the TXT record $($c.Record) = $($c.Value) now." INFO
+        }
+    }
+    if ($published) {
+        try { Save-Challenge -Plugin $script:Le.Plugin -PluginArgs $script:Le.PluginArgs; Write-Log 'DNS challenge records removed via plugin.' OK }
+        catch { Write-Log "Save-Challenge (cleanup) failed: $($_.Exception.Message)" WARN }
+    }
+    $script:Le.Challenges = @()
+}
+
+function Show-LePluginParams {
+    Import-PoshAcme
+    $p = $script:ui.LePluginCombo.Text.Trim()
+    if (-not $p) { throw 'Choose a plugin first.' }
+    Write-Log "Parameters for plugin ${p}:"
+    foreach ($l in ((Get-PAPlugin -Plugin $p -Params | Out-String -Width 200) -split "`r?`n")) { if ($l.Trim()) { Write-Log "  $l" } }
+    Write-Log "Full guide: Get-PAPlugin $p -Guide   (https://poshac.me/docs/latest/Plugins/$p/)"
+}
+
+# ---------------------------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------------------------
 [xml]$xaml = @'
@@ -805,7 +1358,7 @@ function Invoke-RemoveOld {
       <TextBlock x:Name="StatusText" FontSize="15" FontWeight="Bold" VerticalAlignment="Center" Text="Exchange Certificate Swap"/>
     </DockPanel>
 
-    <TabControl Grid.Row="1">
+    <TabControl x:Name="MainTabs" Grid.Row="1">
       <TabItem Header="1. Servers &amp; inventory">
         <Grid Margin="8">
           <Grid.ColumnDefinitions><ColumnDefinition Width="230"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -821,6 +1374,66 @@ function Invoke-RemoveOld {
             <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Foreground="DimGray"
                        Text="Read-only. Role column: Auth = OAuth certificate, InternalTransport = default SMTP certificate, NEW = the validated PFX."/>
             <DataGrid x:Name="InventoryGrid"/>
+          </DockPanel>
+        </Grid>
+      </TabItem>
+
+      <TabItem Header="1b. Let's Encrypt (optional)">
+        <Grid Margin="8">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="480"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+          <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Margin="0,0,10,0">
+            <StackPanel Margin="0,0,8,0">
+              <TextBlock TextWrapping="Wrap" Foreground="DimGray"
+                         Text="Gets a free certificate from Let's Encrypt (via the Posh-ACME module) and hands the PFX to tab 2. Try Staging first: it proves the challenge works without hitting rate limits. Staging certificates are untrusted and cannot be imported."/>
+              <DockPanel Margin="0,8,0,0">
+                <Button x:Name="LeInstallModuleButton" DockPanel.Dock="Right" Content="Install Posh-ACME" Margin="8,0,0,0"/>
+                <TextBlock x:Name="LeModuleText" VerticalAlignment="Center" TextWrapping="Wrap" Text="Posh-ACME: checking..."/>
+              </DockPanel>
+              <TextBlock Margin="0,10,0,2" Text="Environment:"/>
+              <ComboBox x:Name="LeEnvCombo" SelectedIndex="0">
+                <ComboBoxItem Content="Staging (test - untrusted certificate)"/>
+                <ComboBoxItem Content="Production (trusted certificate)"/>
+              </ComboBox>
+              <TextBlock Margin="0,8,0,2" Text="Contact e-mail for the ACME account (optional):"/>
+              <TextBox x:Name="LeEmailBox"/>
+              <CheckBox x:Name="LeTosCheck" Margin="0,6,0,0" Content="I accept the Let's Encrypt Subscriber Agreement"/>
+              <DockPanel Margin="0,10,0,2">
+                <Button x:Name="LeFillNamesButton" DockPanel.Dock="Right" Content="Fill from Exchange URLs" Margin="8,0,0,0"/>
+                <TextBlock VerticalAlignment="Bottom" TextWrapping="Wrap" Text="Names (one per line, first = subject):"/>
+              </DockPanel>
+              <TextBox x:Name="LeNamesBox" Height="90" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" FontFamily="Consolas"/>
+              <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                <TextBlock Text="RSA key size:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <ComboBox x:Name="LeKeyCombo" SelectedIndex="0" Width="90">
+                  <ComboBoxItem Content="2048"/><ComboBoxItem Content="3072"/><ComboBoxItem Content="4096"/>
+                </ComboBox>
+              </StackPanel>
+              <TextBlock Margin="0,12,0,4" FontWeight="Bold" Text="Challenge type:"/>
+              <RadioButton x:Name="LeHttpRadio" GroupName="LeMode" IsChecked="True" Content="HTTP-01: file in IIS (port 80 from the internet must reach Exchange)"/>
+              <TextBlock Margin="20,4,0,2" TextWrapping="Wrap" Text="Webroot of Default Web Site, written on every selected server ({server} and {fqdn} are replaced):"/>
+              <TextBox x:Name="LeWebrootBox" Margin="20,0,0,0" FontFamily="Consolas" Text="\\{fqdn}\C$\inetpub\wwwroot"/>
+              <RadioButton x:Name="LeDnsManualRadio" GroupName="LeMode" Margin="0,10,0,0" Content="DNS-01 manual: the tool shows TXT records, you create them"/>
+              <RadioButton x:Name="LeDnsPluginRadio" GroupName="LeMode" Margin="0,6,0,0" Content="DNS-01 automatic: DNS provider API (Posh-ACME plugin)"/>
+              <DockPanel Margin="20,4,0,2">
+                <Button x:Name="LePluginParamsButton" DockPanel.Dock="Right" Content="Show parameters" Margin="8,0,0,0"/>
+                <ComboBox x:Name="LePluginCombo" IsEditable="True"/>
+              </DockPanel>
+              <TextBlock Margin="20,2,0,2" TextWrapping="Wrap" Foreground="DimGray"
+                         Text="Plugin arguments, one per line as Name=Value. Prefix secrets with secure: (CFToken=secure:abc123). Lists as [a,b]. Values are never logged or saved."/>
+              <TextBox x:Name="LePluginArgsBox" Margin="20,0,0,0" Height="70" AcceptsReturn="True" FontFamily="Consolas" VerticalScrollBarVisibility="Auto"/>
+              <WrapPanel Margin="0,12,0,0">
+                <Button x:Name="LeTestHttpButton" Content="Test HTTP-01 setup" Margin="0,0,8,6"/>
+                <Button x:Name="LeRequestButton" Content="Request certificate" FontWeight="Bold" Margin="0,0,8,6"/>
+                <Button x:Name="LeCheckDnsButton" Content="Check DNS records" Margin="0,0,8,6"/>
+                <Button x:Name="LeContinueButton" Content="Continue (records added)" Margin="0,0,8,6"/>
+                <Button x:Name="LeCleanupButton" Content="Clean up challenges" Margin="0,0,8,6"/>
+              </WrapPanel>
+            </StackPanel>
+          </ScrollViewer>
+          <DockPanel Grid.Column="1">
+            <TextBlock x:Name="LeStatusText" DockPanel.Dock="Top" TextWrapping="Wrap" Foreground="DimGray"
+                       Text="Challenges, TXT records and test results appear here. The issued PFX is loaded into tab 2 automatically."/>
+            <DataGrid x:Name="LeGrid"/>
           </DockPanel>
         </Grid>
       </TabItem>
@@ -903,7 +1516,8 @@ function New-MainWindow {
     $script:ui = $map
 }
 
-$script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'ImportButton', 'EnableButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton'
+$script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'ImportButton', 'EnableButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
+'LeInstallModuleButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
     param([string]$Name, [scriptblock]$Body)
@@ -952,7 +1566,18 @@ function Register-UiEvents {
     $ui.VerifyButton.Add_Click({ Invoke-UiAction 'Verify' { Invoke-Verify } })
     $ui.LoadOldButton.Add_Click({ Invoke-UiAction 'Load candidates' { Update-OldCandidates } })
     $ui.RemoveButton.Add_Click({ Invoke-UiAction 'Remove' { Invoke-RemoveOld } })
+    $ui.LeInstallModuleButton.Add_Click({ Invoke-UiAction 'Install Posh-ACME' { Install-PoshAcme } })
+    $ui.LeFillNamesButton.Add_Click({ Invoke-UiAction 'Fill names' { Set-LeNamesFromExchange } })
+    $ui.LePluginParamsButton.Add_Click({ Invoke-UiAction 'Plugin parameters' { Show-LePluginParams } })
+    $ui.LeTestHttpButton.Add_Click({ Invoke-UiAction 'HTTP-01 test' { Test-LeHttpSetup } })
+    $ui.LeRequestButton.Add_Click({ Invoke-UiAction "Let's Encrypt request" { Start-LeRequest } })
+    $ui.LeCheckDnsButton.Add_Click({ Invoke-UiAction 'Check DNS' { [void](Test-LeDnsRecords) } })
+    $ui.LeContinueButton.Add_Click({ Invoke-UiAction 'Continue' {
+                if (-not @($script:Le.Challenges).Count) { throw 'Nothing to continue - click "Request certificate" first.' }
+                Complete-LeRequest } })
+    $ui.LeCleanupButton.Add_Click({ Invoke-UiAction 'Clean up' { Clear-LeChallenges } })
     $script:Window.Add_ContentRendered({
+            Update-LeModuleStatus
             if (Test-ExchangeAvailable) { Invoke-UiAction 'Load servers' { Update-ServerList; Update-Inventory } }
             else {
                 Write-Log 'Exchange cmdlets not available - only PFX checks will work. Run on an Exchange server.' ERROR
