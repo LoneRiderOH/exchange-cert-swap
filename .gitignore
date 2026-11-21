@@ -1,0 +1,8 @@
+logs/
+*.log
+*.pfx
+*.p12
+*.cer
+*.crt
+*.key
+*.pem
