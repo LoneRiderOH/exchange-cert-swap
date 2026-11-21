@@ -1,13 +1,13 @@
 # Exchange Certificate Swap
 
-A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certificate on on-premises **Exchange Server 2016, 2019 and Subscription Edition** mailbox servers, using a PFX file or a free **Let's Encrypt** certificate. It covers the whole process: inventory, validation, import, enable, verification and safe removal of the old certificate. **Dry run** is on by default.
+A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certificate on on-premises **Exchange Server 2016, 2019 and Subscription Edition** mailbox servers, using a PFX file or a **free certificate** from Let's Encrypt, ZeroSSL, Google Trust Services, SSL.com or Actalis. It covers the whole process: inventory, validation, import, enable, verification and safe removal of the old certificate. **Dry run** is on by default.
 
 ![Screenshot](docs/screenshot.png)
 
 ## Features
 
-- **Let's Encrypt (optional)**: requests a certificate with the [Posh-ACME](https://poshac.me) module and passes the resulting PFX straight to validation. Proof of domain ownership, chosen per request:
-  - **HTTP-01**: the tool writes the challenge file into IIS on **every** selected server, so it works behind a load balancer. It checks that each server serves the file before Let's Encrypt is asked to validate.
+- **Free certificates (optional)**: requests a certificate from **Let's Encrypt, ZeroSSL, Google Trust Services, SSL.com or Actalis** using the [Posh-ACME](https://poshac.me) module, and passes the resulting PFX straight to validation. Proof of domain ownership, chosen per request:
+  - **HTTP-01**: the tool writes the challenge file into IIS on **every** selected server, so it works behind a load balancer. It checks that each server serves the file before the CA is asked to validate.
   - **DNS-01 manual**: the tool shows the `_acme-challenge` TXT records to create, then checks public DNS before continuing. Supports wildcards.
   - **DNS-01 automatic**: uses any of Posh-ACME's ~90 DNS provider plugins (Cloudflare, Route 53, Azure DNS, GoDaddy and more).
 - **Inventory**: lists every Exchange certificate on all selected mailbox servers and marks the **Auth (OAuth)** and **internal transport** certificates.
@@ -40,8 +40,8 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 | .NET Framework | 4.7.2 or newer |
 | Permissions | Organization Management (or a role that can manage Exchange certificates, connectors and transport services) |
 | Network | From the machine running the tool to each server's FQDN on TCP 443 (and 25 for the SMTP check) |
-| Certificate | A PFX (`.pfx`/`.p12`) **with private key**, ideally including the intermediate CA certificates, **or** Let's Encrypt (see below) |
-| Let's Encrypt only | The [Posh-ACME](https://www.powershellgallery.com/packages/Posh-ACME) module (the tool can install it), outbound HTTPS to `acme-v02.api.letsencrypt.org`, and public DNS names. HTTP-01 also needs inbound port 80 from the internet to the Exchange servers and admin share access (`\\server\C$`) to each server. |
+| Certificate | A PFX (`.pfx`/`.p12`) **with private key**, ideally including the intermediate CA certificates, **or** a free ACME certificate (see below) |
+| Free certificates only | The [Posh-ACME](https://www.powershellgallery.com/packages/Posh-ACME) module (the tool can install it), outbound HTTPS to the CA's ACME server, and public DNS names. HTTP-01 also needs inbound port 80 from the internet to the Exchange servers and admin share access (`\\server\C$`) to each server. |
 
 **Not supported:** Edge Transport servers (they aren't in Active Directory; import their certificate locally and recreate the Edge subscription), and Exchange 2013 or older.
 
@@ -64,7 +64,7 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 | Tab | What happens | Changes anything? |
 |---|---|---|
 | **1. Servers & inventory** | Select the mailbox servers to work on (all are selected by default). Review the current certificates. | No |
-| **1b. Let's Encrypt** *(optional)* | Request a certificate instead of bringing a PFX. See [Let's Encrypt](#lets-encrypt) below. When it is issued, the PFX is loaded into tab 2 and validated automatically. | Yes (unless Dry run) |
+| **1b. Free certificate (ACME)** *(optional)* | Request a free certificate instead of bringing a PFX. See [Free certificates](#free-certificates-acme) below. When it is issued, the PFX is loaded into tab 2 and validated automatically. | Yes (unless Dry run) |
 | **2. New certificate (PFX)** | Browse to the PFX, enter its password and click **Validate**. Read the report. Missing host names and connectors that point to the old certificate appear as warnings. | No |
 | **3. Import & enable** | **Step A**: import the PFX on all selected servers. **Step B**: enable it for IIS and SMTP. The old certificate stays on the servers. | Yes |
 | **4. Verify** | Checks that Exchange has the new certificate enabled for IIS and SMTP and that it is served on port 443. You can add extra endpoints, such as `mail.contoso.com` or a load balancer address, to check too. | No |
@@ -72,13 +72,29 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 
 After step 3, update any connectors reported on tab 2 with the command the tool shows. Then load the candidates on tab 5 again.
 
-## Let's Encrypt
+## Free certificates (ACME)
 
-![Let's Encrypt tab](docs/letsencrypt.png)
+![Free certificate tab](docs/letsencrypt.png)
+
+### Certificate authorities
+
+| Certificate authority | Account needed | EAB credentials (first request only) | Staging available |
+|---|---|---|---|
+| **Let's Encrypt** | No | No | Yes |
+| **ZeroSSL** | No | Yes. Click **Get from e-mail** to generate them from the contact e-mail, or copy them from *app.zerossl.com → Developer → EAB Credentials* | No |
+| **Google Trust Services** | Google Cloud project | Yes. In Cloud Shell, run `gcloud services enable publicca.googleapis.com` then `gcloud publicca external-account-keys create`. Use `keyId` as the KID and `b64MacKey` as the HMAC key. The credentials expire after 7 days if unused. For **staging**, run `gcloud config set api_endpoint_overrides/publicca https://preprod-publicca.googleapis.com/` before creating them. | Yes |
+| **SSL.com** (RSA) | Free SSL.com account | Yes, from the SSL.com dashboard | No |
+| **Actalis** | Free Actalis account | Yes, from the Actalis dashboard | No |
+
+EAB (External Account Binding) credentials link your ACME account to your account at the CA. They're needed only the first time: Posh-ACME keeps the account for each CA, so later requests and renewals don't need them. The HMAC key is a password field and is never written to the log.
+
+All of these issue publicly trusted 90-day domain-validated certificates, which Exchange accepts. SSL.com's ECC endpoint is left out because Exchange needs RSA certificates. Each CA's terms and rate limits can change, so check them before relying on a CA.
+
+### Steps
 
 1. Click **Install Posh-ACME** if the module is missing. It installs for the current user from the PowerShell Gallery. The tool looks for the module on `PSModulePath` and also in the PowerShell 7 module folders, your Documents folders (including OneDrive and redirected Documents), Program Files, and a `Modules` folder next to the script. It then loads the module by its full path. If it still shows **NOT found**, the log lists every folder it checked. Click **Re-check** after installing it in another window.
-2. Keep **Environment = Staging** for the first run. Staging uses the full validation process but issues an untrusted certificate. The tool refuses to import staging certificates.
-3. Tick the Subscriber Agreement. The e-mail address is optional.
+2. Choose the **certificate authority**. For the first run, keep **Let's Encrypt - Staging** (or Google Staging). Staging uses the full validation process but issues an untrusted certificate. The tool refuses to import staging certificates.
+3. Tick the subscriber agreement. The e-mail address is optional, except for **Get from e-mail** with ZeroSSL. Fill in the EAB fields if the CA needs them.
 4. Check the **names**. When the tool starts, it fills them in from the CA-issued certificate currently bound to IIS on the selected servers: the subject CN comes first, then the SANs. If the servers use different certificates, their names are combined. If a name is a wildcard, the tool switches to DNS-01. If IIS only has a self-signed certificate, it uses the Exchange URLs instead. The tool never overwrites names you typed. To refill the list, use **Fill from current certificate** or **Fill from Exchange URLs**. Internal names such as `.local`, plain server names and IP addresses are always skipped.
 5. Choose a challenge type:
 
@@ -89,13 +105,13 @@ After step 3, update any connectors reported on tab 2 with the command the tool 
    | **DNS-01 automatic** | Your DNS host has an API | Pick a plugin, click **Show parameters**, and enter the arguments as `Name=Value` lines. Put `secure:` before secrets, for example `CFToken=secure:xxxx`. Secrets are never written to the log. |
 
 6. Click **Request certificate**, with Dry run unticked. When the certificate is issued, the tool removes the challenge files or records and opens tab 2 with the PFX already validated. Then continue with tab 3 as usual.
-7. When it works on Staging, switch to **Production** and request again.
+7. When it works on Staging, switch to a production CA and request again.
 
 Posh-ACME keeps the account, the orders and the issued files in `%LOCALAPPDATA%\Posh-ACME` for the user who ran the tool. The log shows the PFX path. The PFX password is stored with the order: `(Get-PAOrder <name>).PfxPass`.
 
-**Renewal:** Let's Encrypt certificates are valid for 90 days at most, and shorter in future. Run the tool again about every 60 days: request, validate, import and enable on tabs 1b to 4, then remove the old certificate on tab 5. Renewal is not automatic.
+**Renewal:** these certificates are valid for 90 days at most, and the industry maximum keeps shrinking (47 days by 2029). Run the tool again about every 60 days: request, validate, import and enable on tabs 1b to 4, then remove the old certificate on tab 5. Renewal is not automatic.
 
-**Rate limits:** Production allows 5 duplicate certificates per week and 50 certificates per registered domain per week. Test on Staging first.
+**Rate limits:** Let's Encrypt production allows 5 duplicate certificates per week and 50 certificates per registered domain per week. Other CAs have their own limits. Test on Staging first.
 
 ## Things to know
 
@@ -105,7 +121,7 @@ Posh-ACME keeps the account, the orders and the issued files in `%LOCALAPPDATA%\
 - **Load balancers or reverse proxies that terminate TLS** (HAProxy, F5, KEMP, NGINX and so on) need the new certificate installed on them separately. Add their address on tab 4 to check it.
 - **Hybrid deployments**: if your *Outbound to Office 365* connector or the receive connectors point to the old certificate, update them before removing it, and rerun the Hybrid Configuration Wizard if your process requires it.
 - **Posh-ACME shows "NOT found" although you installed it**: check the folder list in the log. Common causes are installing it from PowerShell 7 (`pwsh`) as a *different* user than the one running the tool, or a server with no internet access. For offline servers, run `Save-Module Posh-ACME -Path .\Modules` on another machine and copy the `Modules` folder next to `ExchangeCertTool.ps1`. If loading fails because of the execution policy, the log shows the policy that applies.
-- **Let's Encrypt HTTP-01 fails with 403**: *Require SSL* is set on the root of *Default Web Site*. Use DNS-01, or allow HTTP for `/.well-known/acme-challenge` only.
+- **HTTP-01 fails with 403**: *Require SSL* is set on the root of *Default Web Site*. Use DNS-01, or allow HTTP for `/.well-known/acme-challenge` only.
 - The **Exchange Back End** site (port 444) and the **Auth certificate** are never changed by this tool.
 
 ## Testing without Exchange

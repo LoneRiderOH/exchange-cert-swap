@@ -12,7 +12,8 @@
 
     Workflow (one tab per step):
       1. Servers & inventory  - read-only: lists mailbox servers and every Exchange certificate.
-      1b. Let's Encrypt       - optional: requests a certificate (HTTP-01 or DNS-01) with the
+      1b. Free certificate    - optional: requests a certificate from Let's Encrypt, ZeroSSL, Google
+                                Trust Services, SSL.com or Actalis (HTTP-01 or DNS-01) with the
                                 Posh-ACME module and loads the resulting PFX into tab 2.
       2. New certificate      - read-only: opens the PFX, checks key/expiry/EKU/chain, checks that
                                 every Exchange URL host name is covered, reports connectors that
@@ -71,6 +72,7 @@ $script:State = @{
     Validated    = $false
     MissingHosts = @()
     Verified     = @{}      # server -> $true when Exchange + HTTPS checks passed
+    StagingThumbs = @()     # certificates issued by a staging ACME server in this session
 }
 $script:ui = $null
 $script:Window = $null
@@ -469,7 +471,9 @@ function Invoke-ValidatePfx {
     & $out "SAN names   : $($sanNames -join ', ')"
     & $out ''
 
-    if ($leaf.Issuer -match '\(STAGING\)|Fake LE|Pebble') { $errors.Add('This is a Let''s Encrypt STAGING/test certificate - clients do not trust it. Request it again with Environment = Production.') }
+    if ($leaf.Issuer -match '\(STAGING\)|Fake LE|Pebble|\bTest\b|Staging' -or @($script:State.StagingThumbs) -contains $leaf.Thumbprint) {
+        $errors.Add('This is a STAGING/test certificate - clients do not trust it. Request it again from a production provider.')
+    }
     if ($leaf.NotAfter -lt (Get-Date)) { $errors.Add('Certificate is EXPIRED.') }
     elseif ($leaf.NotBefore -gt (Get-Date)) { $errors.Add("Certificate is not valid yet (NotBefore $($leaf.NotBefore)).") }
     elseif ($daysLeft -lt 30) { $warnings.Add("Certificate expires in $daysLeft days.") }
@@ -784,7 +788,7 @@ function Invoke-RemoveOld {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Let's Encrypt (ACME) via the Posh-ACME module - tab "1b"
+# Free ACME certificates (Let's Encrypt, ZeroSSL, Google, SSL.com, Actalis) via Posh-ACME - tab "1b"
 # ---------------------------------------------------------------------------------------------
 $script:Le = @{
     Mode       = $null      # 'HTTP' | 'DNSManual' | 'DNSPlugin'
@@ -797,7 +801,7 @@ $script:LeHttpPort = 80
 $script:LeDnsResolvers = @('1.1.1.1', '8.8.8.8')
 $script:LeWebConfig = @'
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Created by ExchangeCertTool for Let's Encrypt HTTP-01 validation. Safe to delete. -->
+<!-- Created by ExchangeCertTool for ACME HTTP-01 validation. Safe to delete. -->
 <configuration>
   <system.webServer>
     <httpRedirect enabled="false" />
@@ -873,7 +877,7 @@ function Import-PoshAcme {
 
 function Update-LeModuleStatus {
     if (-not (Test-PoshAcme)) {
-        $script:ui.LeModuleText.Text = 'Posh-ACME: NOT found (needed for Let''s Encrypt). See the log for the folders searched.'
+        $script:ui.LeModuleText.Text = 'Posh-ACME: NOT found (needed for free ACME certificates). See the log for the folders searched.'
         $script:ui.LeModuleText.Foreground = [System.Windows.Media.Brushes]::Firebrick
         Write-PoshAcmeDiagnostics
         return
@@ -928,9 +932,9 @@ function Get-LeNames {
     if (-not $names) { throw 'Enter at least one name for the certificate.' }
     foreach ($n in $names) {
         if ($n -notmatch '^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$') { throw "Not a valid DNS name: $n" }
-        if ($n -match '\.(local|lan|internal|corp|intra|localdomain|home|private)$') { throw "Let's Encrypt cannot issue certificates for internal names: $n" }
+        if ($n -match '\.(local|lan|internal|corp|intra|localdomain|home|private)$') { throw "Public CAs cannot issue certificates for internal names: $n" }
     }
-    if ($names.Count -gt 100) { throw "Let's Encrypt allows at most 100 names per certificate (you have $($names.Count))." }
+    if ($names.Count -gt 100) { throw "ACME certificates allow at most 100 names (you have $($names.Count))." }
     $names
 }
 
@@ -993,10 +997,10 @@ function Set-LeNamesFromCurrentCert {
         Write-Log ("Current IIS certificate on {0}: {1} {2}, expires {3:yyyy-MM-dd}, issuer {4}" -f ($c.Servers -join ', '), $c.Thumbprint, $c.Subject, $c.NotAfter, $c.Issuer)
     }
     if ($certs.Count -gt 1) { Write-Log "The selected servers use $($certs.Count) different certificates - the names of all of them were combined." WARN }
-    foreach ($s in $skipped) { Write-Log "Skipping $s (internal name or IP - Let's Encrypt cannot issue for it)." WARN }
+    foreach ($s in $skipped) { Write-Log "Skipping $s (internal name or IP - public CAs cannot issue for it)." WARN }
     if (-not $names.Count) {
-        if ($Auto) { Write-Log 'The current certificate has no public names usable for Let''s Encrypt.' WARN; return $false }
-        throw 'The current certificate has no public names usable for Let''s Encrypt.'
+        if ($Auto) { Write-Log 'The current certificate has no public names usable for a public CA.' WARN; return $false }
+        throw 'The current certificate has no public names usable for a public CA.'
     }
     $script:ui.LeNamesBox.Text = ($names -join "`r`n")
     if (($names -match '^\*') -and $script:ui.LeHttpRadio.IsChecked) {
@@ -1014,7 +1018,7 @@ function Invoke-LeAutoFill {
         if (Set-LeNamesFromCurrentCert -Auto) { return }
         Set-LeNamesFromExchange
     }
-    catch { Write-Log "Could not pre-fill Let's Encrypt names: $($_.Exception.Message)" WARN }
+    catch { Write-Log "Could not pre-fill certificate names: $($_.Exception.Message)" WARN }
 }
 
 function Set-LeNamesFromExchange {
@@ -1024,7 +1028,7 @@ function Set-LeNamesFromExchange {
     $hosts = New-Object System.Collections.Generic.List[string]
     foreach ($h in @(Get-ExchangeHostNames -Servers $servers | Select-Object -ExpandProperty Host -Unique)) {
         if ($h -match $script:LeInternalNamePattern -or $h -notmatch '\.') {
-            Write-Log "Skipping internal name $h (Let's Encrypt cannot issue for it)." WARN; continue
+            Write-Log "Skipping internal name $h (public CAs cannot issue for it)." WARN; continue
         }
         if (-not $hosts.Contains($h)) { $hosts.Add($h) }
     }
@@ -1063,7 +1067,7 @@ function Get-LeWebroots {
     $template = $script:ui.LeWebrootBox.Text.Trim()
     if (-not $template) { throw 'Enter the webroot path for HTTP-01.' }
     $servers = Get-SelectedServers
-    if (-not $servers) { throw 'Select the servers on tab 1. The challenge file goes to every selected server, because a load balancer can send Let''s Encrypt to any of them.' }
+    if (-not $servers) { throw 'Select the servers on tab 1. The challenge file goes to every selected server, because a load balancer can send the CA''s validation request to any of them.' }
     foreach ($s in $servers) {
         $fqdn = if ($script:State.Servers.ContainsKey($s) -and $script:State.Servers[$s].Fqdn) { $script:State.Servers[$s].Fqdn } else { $s }
         [pscustomobject]@{ Server = $s; Fqdn = $fqdn; Root = (($template -replace '\{server\}', $s) -replace '\{fqdn\}', $fqdn) }
@@ -1113,7 +1117,7 @@ function Get-LeProbeHint {
     param($Probe)
     if ($Probe.Ok) { return '' }
     switch -Regex ("$($Probe.Status)") {
-        '^30\d' { return 'IIS redirects this path; Let''s Encrypt follows redirects only to the same name on 80/443. Check HTTP Redirect on Default Web Site.' }
+        '^30\d' { return 'IIS redirects this path; CAs follow redirects only to the same name on 80/443. Check HTTP Redirect on Default Web Site.' }
         '^403' { return '"Require SSL" is probably set on Default Web Site - HTTP-01 needs plain HTTP on port 80.' }
         '^404' { return 'File not served - is the webroot path the physical path of Default Web Site?' }
         'no response' { return 'Port 80 not reachable from here (firewall, or IIS not listening on 80).' }
@@ -1197,16 +1201,74 @@ function Test-LeHttpSetup {
     $script:ui.LeStatusText.Text = 'HTTP-01 test done. This checks IIS on each server from inside your network; it cannot prove that port 80 from the internet reaches Exchange (check your firewall / load balancer).'
 }
 
+# Free ACME certificate authorities supported by Posh-ACME (order = combo box order).
+# EC-only endpoints (SSLCOM_ECC) are left out on purpose: Exchange needs RSA certificates.
+$script:AcmeProviders = @(
+    [pscustomobject]@{ Name = 'Let''s Encrypt'; Label = 'Let''s Encrypt - Staging (test, untrusted)'; Server = 'LE_STAGE'; Staging = $true; Eab = $false
+        Help = 'No account needed. Use Staging first to prove the challenge works.'; Limits = '' }
+    [pscustomobject]@{ Name = 'Let''s Encrypt'; Label = 'Let''s Encrypt - Production'; Server = 'LE_PROD'; Staging = $false; Eab = $false
+        Help = 'No account needed.'; Limits = 'Let''s Encrypt allows 5 certificates for the same set of names per week.' }
+    [pscustomobject]@{ Name = 'ZeroSSL'; Label = 'ZeroSSL'; Server = 'ZEROSSL_PROD'; Staging = $false; Eab = $true
+        Help = 'Needs EAB credentials (only for the first request). Click "Get from e-mail" to generate them from the contact e-mail, or copy them from app.zerossl.com > Developer > EAB Credentials.'; Limits = '' }
+    [pscustomobject]@{ Name = 'Google Trust Services'; Label = 'Google Trust Services - Staging (test, untrusted)'; Server = 'GOOGLE_STAGE'; Staging = $true; Eab = $true
+        Help = 'Needs a Google Cloud project. In Cloud Shell: gcloud services enable publicca.googleapis.com ; gcloud config set api_endpoint_overrides/publicca https://preprod-publicca.googleapis.com/ ; gcloud publicca external-account-keys create  -> keyId = EAB key ID, b64MacKey = HMAC key. Staging keys only work on staging. Use within 7 days.'; Limits = '' }
+    [pscustomobject]@{ Name = 'Google Trust Services'; Label = 'Google Trust Services - Production'; Server = 'GOOGLE_PROD'; Staging = $false; Eab = $true
+        Help = 'Needs a Google Cloud project. In Cloud Shell: gcloud services enable publicca.googleapis.com ; gcloud publicca external-account-keys create  -> keyId = EAB key ID, b64MacKey = HMAC key. Use within 7 days.'; Limits = '' }
+    [pscustomobject]@{ Name = 'SSL.com'; Label = 'SSL.com (RSA)'; Server = 'SSLCOM_RSA'; Staging = $false; Eab = $true
+        Help = 'Needs a free SSL.com account. Copy the ACME credentials (account key = EAB key ID, HMAC key) from your SSL.com dashboard.'; Limits = '' }
+    [pscustomobject]@{ Name = 'Actalis'; Label = 'Actalis'; Server = 'ACTALIS_PROD'; Staging = $false; Eab = $true
+        Help = 'Needs a free Actalis account with the free ACME certificate product. Copy the EAB KID and HMAC key from the Actalis dashboard.'; Limits = '' }
+)
+
+function Get-AcmeProvider {
+    $i = 0
+    if ($script:ui -and $script:ui.LeProviderCombo -and $script:ui.LeProviderCombo.SelectedIndex -ge 0) { $i = $script:ui.LeProviderCombo.SelectedIndex }
+    $script:AcmeProviders[$i]
+}
+
+function Update-AcmeProviderUi {
+    $pr = Get-AcmeProvider
+    $script:ui.LeEabPanel.Visibility = if ($pr.Eab) { 'Visible' } else { 'Collapsed' }
+    $script:ui.LeZeroSslEabButton.Visibility = if ($pr.Server -eq 'ZEROSSL_PROD') { 'Visible' } else { 'Collapsed' }
+    $script:ui.LeProviderHelpText.Text = $pr.Help
+    $script:ui.LeTosCheck.Content = "I accept the $($pr.Name) subscriber agreement / terms of service"
+    $script:ui.LeTosCheck.IsChecked = $false
+    $script:ui.LeEabKidBox.Text = ''
+    $script:ui.LeEabHmacBox.Password = ''
+}
+
+function Get-ZeroSslEab {
+    $email = $script:ui.LeEmailBox.Text.Trim()
+    if ($email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'Enter a valid contact e-mail first - ZeroSSL ties the EAB credentials to it.' }
+    $msg = "Ask ZeroSSL (api.zerossl.com) for EAB credentials for $email?`n`nThis registers the address with ZeroSSL if it is new."
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - ZeroSSL is not contacted)" }
+    if (-not (Confirm-Action $msg 'ZeroSSL EAB')) { Write-Log 'Cancelled.' WARN; return }
+    if (Test-DryRun) { Write-Log "[DRY RUN] POST https://api.zerossl.com/acme/eab-credentials-email email=$email" CMD; return }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Write-Log "POST https://api.zerossl.com/acme/eab-credentials-email email=$email" CMD
+    $r = Invoke-RestMethod -Method Post -Uri 'https://api.zerossl.com/acme/eab-credentials-email' -Body @{ email = $email } -UseBasicParsing -TimeoutSec 30
+    if (-not $r.success -or -not $r.eab_kid -or -not $r.eab_hmac_key) {
+        throw "ZeroSSL did not return EAB credentials: $(($r | ConvertTo-Json -Compress -Depth 3) -replace '"eab_hmac_key":"[^"]*"', '"eab_hmac_key":"<hidden>"')"
+    }
+    $script:ui.LeEabKidBox.Text = "$($r.eab_kid)"
+    $script:ui.LeEabHmacBox.Password = "$($r.eab_hmac_key)"
+    Write-Log "ZeroSSL EAB credentials received (key ID $($r.eab_kid))." OK
+}
+
 function Start-LeRequest {
     $names = @(Get-LeNames)
     $mode = Get-LeMode
     if ($mode -eq 'HTTP' -and ($names -match '^\*')) { throw 'Wildcard names need DNS-01. Choose a DNS-01 option or remove the wildcard.' }
-    if (-not $script:ui.LeTosCheck.IsChecked) { throw 'Tick "I accept the Let''s Encrypt Subscriber Agreement" first.' }
+    $provider = Get-AcmeProvider
+    if (-not $script:ui.LeTosCheck.IsChecked) { throw "Tick ""I accept the $($provider.Name) subscriber agreement"" first." }
     if ($script:Le.Challenges.Count) { throw 'A previous request still has challenges in place. Click "Continue" or "Clean up challenges" first.' }
     $email = $script:ui.LeEmailBox.Text.Trim()
     if ($email -and $email -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw "Not a valid e-mail address: $email" }
-    $prod = ($script:ui.LeEnvCombo.SelectedIndex -eq 1)
-    $acmeServer = if ($prod) { 'LE_PROD' } else { 'LE_STAGE' }
+    $prod = -not $provider.Staging
+    $acmeServer = $provider.Server
+    $eabKid = $script:ui.LeEabKidBox.Text.Trim()
+    $eabHmac = $script:ui.LeEabHmacBox.Password.Trim()
+    if ($provider.Eab -and [bool]$eabKid -ne [bool]$eabHmac) { throw 'Enter both the EAB key ID and the EAB HMAC key (or neither, if an ACME account for this provider already exists).' }
     $keyLen = "$($script:ui.LeKeyCombo.SelectedItem.Content)"
     $plugin = $null; $pluginArgs = $null; $roots = @()
     if ($mode -eq 'DNSPlugin') {
@@ -1217,16 +1279,16 @@ function Start-LeRequest {
     if ($mode -eq 'HTTP') { $roots = @(Get-LeWebroots) }
 
     $modeText = @{ HTTP = 'HTTP-01 (file in IIS)'; DNSManual = 'DNS-01 (you add TXT records)'; DNSPlugin = "DNS-01 via plugin $plugin" }[$mode]
-    $msg = "Request a certificate from Let's Encrypt $(if ($prod) { 'PRODUCTION' } else { 'STAGING (test, untrusted)' })`n`n" +
+    $msg = "Request a certificate from $($provider.Label)`n`n" +
     "Names:`n  $($names -join "`n  ")`n`nChallenge: $modeText`nKey: RSA $keyLen"
     if ($mode -eq 'HTTP') { $msg += "`n`nChallenge files will be written to:`n  $(($roots | ForEach-Object { $_.Root }) -join "`n  ")" }
-    if ($prod) { $msg += "`n`nProduction has rate limits (5 identical certificates per week). Test with Staging first." }
-    if (Test-DryRun) { $msg += "`n`n(DRY RUN - Let's Encrypt is not contacted, nothing is written)" }
-    if (-not (Confirm-Action $msg "Let's Encrypt request")) { Write-Log 'Request cancelled.' WARN; return }
+    if ($provider.Limits) { $msg += "`n`n$($provider.Limits) Test with a staging provider first." }
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - $($provider.Name) is not contacted, nothing is written)" }
+    if (-not (Confirm-Action $msg "$($provider.Name) request")) { Write-Log 'Request cancelled.' WARN; return }
 
     if (Test-DryRun) {
         Write-Log "[DRY RUN] Set-PAServer $acmeServer" CMD
-        Write-Log "[DRY RUN] New-PAAccount -AcceptTOS$(if ($email) { " -Contact $email" }) (only if no account exists yet)" CMD
+        Write-Log "[DRY RUN] New-PAAccount -AcceptTOS$(if ($email) { " -Contact $email" })$(if ($eabKid) { " -ExtAcctKID $eabKid -ExtAcctHMACKey <hidden>" }) (only if no account exists yet)" CMD
         Write-Log "[DRY RUN] New-PAOrder -Domain $($names -join ',') -KeyLength $keyLen -PfxPass <random> -Force" CMD
         switch ($mode) {
             'HTTP' { foreach ($r in $roots) { Write-Log "[DRY RUN] write <token> + web.config to $($r.Root)\.well-known\acme-challenge\" CMD } }
@@ -1242,17 +1304,23 @@ function Start-LeRequest {
     Set-PAServer $acmeServer
     $acct = Get-PAAccount
     if (-not $acct -or "$($acct.status)" -ne 'valid') {
-        Write-Log "New-PAAccount -AcceptTOS$(if ($email) { " -Contact $email" })" CMD
+        if ($provider.Eab -and -not $eabKid) {
+            throw "$($provider.Name) needs EAB credentials to create the ACME account on this server. $($provider.Help)"
+        }
+        Write-Log "New-PAAccount -AcceptTOS$(if ($email) { " -Contact $email" })$(if ($eabKid) { " -ExtAcctKID $eabKid -ExtAcctHMACKey <hidden>" })" CMD
         $acctArgs = @{ AcceptTOS = $true; Force = $true }
         if ($email) { $acctArgs.Contact = $email }
+        if ($eabKid) { $acctArgs.ExtAcctKID = $eabKid; $acctArgs.ExtAcctHMACKey = $eabHmac }
         $acct = New-PAAccount @acctArgs
     }
+    elseif ($eabKid) { Write-Log "An ACME account for $($provider.Name) already exists ($($acct.id)) - the EAB credentials were not needed." }
     Write-Log "ACME account: $($acct.id) ($acmeServer)"
 
     Write-Log "New-PAOrder -Domain $($names -join ',') -KeyLength $keyLen -PfxPass <random> -Force" CMD
     $order = New-PAOrder -Domain $names -KeyLength $keyLen -PfxPassSecure (New-RandomSecurePassword) -FriendlyName ("Exchange {0} {1:yyyy-MM-dd}" -f $names[0], (Get-Date)) -Force
     Write-Log "Order $($order.Name) created, status $($order.status)."
 
+    $script:Le.Provider = $provider
     $script:Le.Mode = $mode; $script:Le.Plugin = $plugin; $script:Le.PluginArgs = $pluginArgs; $script:Le.Names = $names
     $challenges = New-Object System.Collections.Generic.List[object]
     try {
@@ -1260,7 +1328,7 @@ function Start-LeRequest {
             if ("$($a.status)" -eq 'valid') { Write-Log "$($a.fqdn): already authorized (reused)." OK; continue }
             if ("$($a.status)" -ne 'pending') { throw "Authorization for $($a.fqdn) is '$($a.status)'." }
             if ($mode -eq 'HTTP') {
-                if (-not $a.HTTP01Token) { throw "Let's Encrypt offered no HTTP-01 challenge for $($a.fqdn)." }
+                if (-not $a.HTTP01Token) { throw "The CA offered no HTTP-01 challenge for $($a.fqdn)." }
                 $c = New-LeChallenge $a 'http-01'
                 $c.Value = Get-KeyAuthorization $c.Token
                 foreach ($r in $roots) {
@@ -1274,7 +1342,7 @@ function Start-LeRequest {
                 }
             }
             else {
-                if (-not $a.DNS01Token) { throw "Let's Encrypt offered no DNS-01 challenge for $($a.fqdn)." }
+                if (-not $a.DNS01Token) { throw "The CA offered no DNS-01 challenge for $($a.fqdn)." }
                 $c = New-LeChallenge $a 'dns-01'
                 $c.Record = "_acme-challenge.$($c.DnsId)"
                 $c.Value = Get-KeyAuthorization $c.Token -ForDNS
@@ -1349,7 +1417,7 @@ function Complete-LeRequest {
             while (-not (Test-LeDnsRecords -Quiet)) {
                 if ((Get-Date) -gt $deadline) {
                     if ($script:Le.Mode -eq 'DNSManual') { $keepChallenges = $true; throw 'TXT records are still not visible on public resolvers. Check them, then click "Continue" again.' }
-                    Write-Log 'TXT records not visible on public resolvers yet - asking Let''s Encrypt to validate anyway.' WARN
+                    Write-Log 'TXT records not visible on public resolvers yet - asking the CA to validate anyway.' WARN
                     break
                 }
                 Wait-Ui 10
@@ -1376,10 +1444,10 @@ function Complete-LeRequest {
                     $err = @($b.challenges | Where-Object { $_.error } | ForEach-Object { $_.error.detail }) -join '; '
                     "$($b.fqdn): $($b.status) - $err"
                 }
-                throw "Let's Encrypt validation failed:`n$($details -join "`n")"
+                throw "$($script:Le.Provider.Name) validation failed:`n$($details -join "`n")"
             }
             if (-not @($auths | Where-Object { "$($_.status)" -ne 'valid' })) { break }
-            if ((Get-Date) -gt $deadline) { throw 'Timed out waiting for Let''s Encrypt to validate the challenges.' }
+            if ((Get-Date) -gt $deadline) { throw 'Timed out waiting for the CA to validate the challenges.' }
             Wait-Ui 3
         }
         Write-Log 'All names validated.' OK
@@ -1404,7 +1472,8 @@ function Complete-LeRequest {
         Write-Log 'Complete-PAOrder' CMD
         $cert = $order | Complete-PAOrder
         if (-not $cert -or -not $cert.PfxFullChain -or -not (Test-Path -LiteralPath $cert.PfxFullChain)) { throw 'Certificate issued, but fullchain.pfx was not found.' }
-        Write-Log ("Certificate issued: {0}, thumbprint {1}, expires {2:yyyy-MM-dd}." -f $cert.Subject, $cert.Thumbprint, $cert.NotAfter) OK
+        Write-Log ("Certificate issued by {3}: {0}, thumbprint {1}, expires {2:yyyy-MM-dd}." -f $cert.Subject, $cert.Thumbprint, $cert.NotAfter, $script:Le.Provider.Label) OK
+        if ($script:Le.Provider.Staging) { $script:State.StagingThumbs += "$($cert.Thumbprint)" }
         Write-Log "PFX: $($cert.PfxFullChain) (password kept by Posh-ACME: (Get-PAOrder '$($order.Name)').PfxPass)"
     }
     finally { if (-not $keepChallenges) { Clear-LeChallenges } }
@@ -1498,26 +1567,33 @@ function Show-LePluginParams {
         </Grid>
       </TabItem>
 
-      <TabItem Header="1b. Let's Encrypt (optional)">
+      <TabItem Header="1b. Free certificate (ACME)">
         <Grid Margin="8">
           <Grid.ColumnDefinitions><ColumnDefinition Width="480"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
           <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Margin="0,0,10,0">
             <StackPanel Margin="0,0,8,0">
               <TextBlock TextWrapping="Wrap" Foreground="DimGray"
-                         Text="Gets a free certificate from Let's Encrypt (via the Posh-ACME module) and hands the PFX to tab 2. Try Staging first: it proves the challenge works without hitting rate limits. Staging certificates are untrusted and cannot be imported."/>
+                         Text="Gets a free certificate from Let's Encrypt, ZeroSSL, Google, SSL.com or Actalis (via the Posh-ACME module) and hands the PFX to tab 2. Try a Staging provider first: it proves the challenge works without hitting rate limits. Staging certificates are untrusted and cannot be imported."/>
               <DockPanel Margin="0,8,0,0">
                 <Button x:Name="LeRecheckModuleButton" DockPanel.Dock="Right" Content="Re-check" Margin="6,0,0,0"/>
                 <Button x:Name="LeInstallModuleButton" DockPanel.Dock="Right" Content="Install Posh-ACME" Margin="8,0,0,0"/>
                 <TextBlock x:Name="LeModuleText" VerticalAlignment="Center" TextWrapping="Wrap" Text="Posh-ACME: checking..."/>
               </DockPanel>
-              <TextBlock Margin="0,10,0,2" Text="Environment:"/>
-              <ComboBox x:Name="LeEnvCombo" SelectedIndex="0">
-                <ComboBoxItem Content="Staging (test - untrusted certificate)"/>
-                <ComboBoxItem Content="Production (trusted certificate)"/>
-              </ComboBox>
-              <TextBlock Margin="0,8,0,2" Text="Contact e-mail for the ACME account (optional):"/>
+              <TextBlock Margin="0,10,0,2" Text="Certificate authority:"/>
+              <ComboBox x:Name="LeProviderCombo"/>
+              <TextBlock x:Name="LeProviderHelpText" Margin="0,4,0,0" TextWrapping="Wrap" Foreground="DimGray"/>
+              <TextBlock Margin="0,8,0,2" Text="Contact e-mail for the ACME account (optional; required for ZeroSSL e-mail EAB):"/>
               <TextBox x:Name="LeEmailBox"/>
-              <CheckBox x:Name="LeTosCheck" Margin="0,6,0,0" Content="I accept the Let's Encrypt Subscriber Agreement"/>
+              <StackPanel x:Name="LeEabPanel" Margin="0,8,0,0" Visibility="Collapsed">
+                <DockPanel>
+                  <Button x:Name="LeZeroSslEabButton" DockPanel.Dock="Right" Content="Get from e-mail" Margin="8,0,0,0" Visibility="Collapsed"/>
+                  <TextBlock VerticalAlignment="Center" Text="EAB key ID (KID):"/>
+                </DockPanel>
+                <TextBox x:Name="LeEabKidBox" Margin="0,2,0,0" FontFamily="Consolas"/>
+                <TextBlock Margin="0,6,0,2" Text="EAB HMAC key (never logged; only needed for the first request):"/>
+                <PasswordBox x:Name="LeEabHmacBox"/>
+              </StackPanel>
+              <CheckBox x:Name="LeTosCheck" Margin="0,6,0,0" Content="I accept the subscriber agreement"/>
               <TextBlock Margin="0,10,0,2" TextWrapping="Wrap"
                          Text="Names (one per line, first = subject). Pre-filled from the certificate currently on IIS:"/>
               <TextBox x:Name="LeNamesBox" Height="90" AcceptsReturn="True" VerticalScrollBarVisibility="Auto" FontFamily="Consolas"/>
@@ -1640,7 +1716,7 @@ function New-MainWindow {
 }
 
 $script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'ImportButton', 'EnableButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
-'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
+'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
     param([string]$Name, [scriptblock]$Body)
@@ -1692,10 +1768,15 @@ function Register-UiEvents {
     $ui.LeInstallModuleButton.Add_Click({ Invoke-UiAction 'Install Posh-ACME' { Install-PoshAcme } })
     $ui.LeFillNamesButton.Add_Click({ Invoke-UiAction 'Fill names' { Set-LeNamesFromExchange } })
     $ui.LeFillCertButton.Add_Click({ Invoke-UiAction 'Fill from certificate' { [void](Set-LeNamesFromCurrentCert) } })
+    foreach ($pr in $script:AcmeProviders) { [void]$ui.LeProviderCombo.Items.Add($pr.Label) }
+    $ui.LeProviderCombo.SelectedIndex = 0
+    Update-AcmeProviderUi
+    $ui.LeProviderCombo.Add_SelectionChanged({ Update-AcmeProviderUi })
+    $ui.LeZeroSslEabButton.Add_Click({ Invoke-UiAction 'ZeroSSL EAB' { Get-ZeroSslEab } })
     $ui.LeRecheckModuleButton.Add_Click({ Invoke-UiAction 'Re-check Posh-ACME' { Update-LeModuleStatus } })
     $ui.LePluginParamsButton.Add_Click({ Invoke-UiAction 'Plugin parameters' { Show-LePluginParams } })
     $ui.LeTestHttpButton.Add_Click({ Invoke-UiAction 'HTTP-01 test' { Test-LeHttpSetup } })
-    $ui.LeRequestButton.Add_Click({ Invoke-UiAction "Let's Encrypt request" { Start-LeRequest } })
+    $ui.LeRequestButton.Add_Click({ Invoke-UiAction 'Certificate request' { Start-LeRequest } })
     $ui.LeCheckDnsButton.Add_Click({ Invoke-UiAction 'Check DNS' { [void](Test-LeDnsRecords) } })
     $ui.LeContinueButton.Add_Click({ Invoke-UiAction 'Continue' {
                 if (-not @($script:Le.Challenges).Count) { throw 'Nothing to continue - click "Request certificate" first.' }
