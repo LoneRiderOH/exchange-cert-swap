@@ -16,8 +16,9 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
   - the PFX contains a private key, is in its validity period and has the Server Authentication EKU
   - the chain builds to a trusted root
   - every `InternalUrl`/`ExternalUrl` on the OWA, ECP, EWS, OAB, ActiveSync and MAPI virtual directories, plus the Autodiscover SCP, is covered by the certificate's SANs (wildcards are handled correctly)
-  - lists Send and Receive connectors whose `TlsCertificateName` still points to the old certificate, with the `Set-*Connector` command to fix each one
+  - lists Send and Receive connectors whose `TlsCertificateName` still points to the old certificate
 - **Import to multiple servers**: imports the **same PFX** on every selected server with `Import-ExchangeCertificate -FileData`, so the tool doesn't need to be run on each server.
+- **SMTP connectors**: updates Send and Receive connectors whose `TlsCertificateName` points to the old certificate, such as the hybrid *Outbound to Office 365* and *Default Frontend* connectors set by the HCW. It can also pin the new certificate on the **Default Frontend** connector (port 25), so internet senders get the public certificate on STARTTLS instead of the self-signed one. The connector FQDN is never changed, and rollback commands are logged.
 - **Enable for IIS and SMTP**: if `Enable-ExchangeCertificate -Force` replaces the **internal transport certificate**, the tool restores the previous one unless you choose otherwise.
 - **Verification on the network**: opens a real TLS connection to each server on port 443 and compares the served thumbprint with the new certificate. It also checks SMTP port 25 with STARTTLS (for information only) and any extra endpoints you list, such as a load balancer or public name.
 - **Safe removal of the old certificate**: a certificate is removed only if:
@@ -67,11 +68,27 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 | **1. Servers & inventory** | Select the mailbox servers to work on (all are selected by default). Review the current certificates. | No |
 | **1b. Free certificate (ACME)** *(optional)* | Request a free certificate instead of bringing a PFX. See [Free certificates](#free-certificates-acme) below. When it is issued, the PFX is loaded into tab 2 and validated automatically. | Yes (unless Dry run) |
 | **2. New certificate (PFX)** | Browse to the PFX, enter its password and click **Validate**. Read the report. Missing host names and connectors that point to the old certificate appear as warnings. | No |
-| **3. Import & enable** | **Step A**: import the PFX on all selected servers. **Step B**: enable it for IIS and SMTP. The old certificate stays on the servers. | Yes |
+| **3. Import & enable** | **Step A**: import the PFX on all selected servers. **Step B**: enable it for IIS and SMTP. **Step C**: update the SMTP connectors (see [SMTP connectors](#smtp-connectors-default-frontend)). The old certificate stays on the servers. | Yes |
 | **4. Verify** | Checks that Exchange has the new certificate enabled for IIS and SMTP and that it is served on port 443. You can add extra endpoints, such as `mail.contoso.com` or a load balancer address, to check too. | No |
 | **5. Remove old certificate** *(optional)* | Click **Load candidates**. The `Blockers` column shows why a certificate can't be removed yet. Select the rows to remove and confirm. | Yes |
 
-After step 3, update any connectors reported on tab 2 with the command the tool shows. Then load the candidates on tab 5 again.
+## SMTP connectors (Default Frontend)
+
+If a receive connector has no `TlsCertificateName`, Exchange offers the certificate that matches the **connector FQDN** on STARTTLS. On the **Default Frontend \<server\>** connector (port 25, where internet mail arrives), the FQDN is normally the server's own name, such as `ex01.contoso.local`, so senders get the server's **self-signed** certificate even after you install a public one. Opportunistic TLS still works, but partners that enforce TLS, MTA-STS, DANE and hybrid mail flow expect the public certificate.
+
+**Step C** on tab 3 fixes this without changing the connector FQDN. Changing the FQDN on Default Frontend can break Kerberos authentication between Exchange servers, so the tool leaves it alone.
+
+| Connector | What Step C does |
+|---|---|
+| Any Send or Receive connector with `TlsCertificateName` set to the **old** certificate (e.g. *Outbound to Office 365* and *Default Frontend* after running the HCW) | Switches it to the new certificate. This is needed at every Let's Encrypt renewal, because the issuing CA name changes between certificates (R10, R11, R12 …). |
+| **Default Frontend** (port 25) with no `TlsCertificateName`, when its FQDN is not on the new certificate | Pins the new certificate (on by default, can be unticked) |
+| **Client Frontend** (port 587, SMTP submission) | Same, but only if you tick the option |
+| A frontend connector whose FQDN *is* on the new certificate | Nothing; Exchange already picks the new certificate |
+| A connector pinned to some other certificate, and the backend **Default \<server\>** connector (port 2525) | Nothing |
+
+Use **Preview connector changes** to see the plan, which is also shown after validation. Step C refuses to pin a certificate on a server where it isn't enabled for SMTP yet: run Step B first, otherwise STARTTLS stops working (event 12014). For every change, the log contains the rollback command with the previous value. After Step C, wait a few minutes for transport to pick up the change, then run **tab 4**. The *SMTP :25 STARTTLS* check passes when the new certificate is served, and fails if the connector is pinned but the old certificate is still offered.
+
+Tab 5 won't remove the old certificate while any connector still points to it.
 
 ## Free certificates (ACME)
 
@@ -139,7 +156,7 @@ Posh-ACME keeps the account, the orders and the issued files in `%LOCALAPPDATA%\
 ## Things to know
 
 - **Port 443 still serves the old certificate after enabling.** Check the HTTPS binding on *Default Web Site* in IIS Manager. If the binding is correct, run `iisreset /noforce` during a quiet period.
-- **Port 25 still shows the old or self-signed certificate.** This is often expected. Exchange chooses the SMTP certificate by matching the receive connector's FQDN, so a connector using the server's own internal name keeps the self-signed certificate. Internet SMTP uses the name on your public MX connector.
+- **Port 25 still shows the old or self-signed certificate.** Run tab 3, Step C, which pins the new certificate on *Default Frontend*. If tab 4 still shows the old certificate a few minutes after Step C, restart the *Microsoft Exchange Frontend Transport* service during a quiet period.
 - **Internal names such as `.local`**: public CAs can't issue certificates for them. Change the `InternalUrl` values to a public name that is on the certificate, and use split DNS. The tool lists these names during validation.
 - **Load balancers or reverse proxies that terminate TLS** (HAProxy, F5, KEMP, NGINX and so on) need the new certificate installed on them separately. Add their address on tab 4 to check it.
 - **Hybrid deployments**: if your *Outbound to Office 365* connector or the receive connectors point to the old certificate, update them before removing it, and rerun the Hybrid Configuration Wizard if your process requires it.

@@ -20,6 +20,8 @@
                                 pin the old certificate via TlsCertificateName.
       3. Import & enable      - imports the same PFX into every selected server, enables it for
                                 IIS + SMTP. Keeps the internal transport certificate unless asked.
+                                Step C updates connectors pinned to the old certificate and can pin
+                                the new one on 'Default Frontend' (25) / 'Client Frontend' (587).
       4. Verify               - checks Exchange's view and the certificate actually served on
                                 HTTPS 443 (and SMTP 25 STARTTLS, informational).
       5. Remove old           - optional; refuses to remove certificates still in use
@@ -426,6 +428,155 @@ function Get-ConnectorTlsReport {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Step 3C: SMTP connectors (TlsCertificateName)
+# ---------------------------------------------------------------------------------------------
+function Test-TlsNameMatches {
+    param([string]$Tls, [string]$Issuer, [string]$Subject)
+    if ($Tls -notmatch '^<I>(.*?)<S>(.*)$') { return $false }
+    $ti = $Matches[1]; $ts = $Matches[2]
+    ((ConvertTo-NormalizedDn $ti) -eq (ConvertTo-NormalizedDn $Issuer)) -and ((ConvertTo-NormalizedDn $ts) -eq (ConvertTo-NormalizedDn $Subject))
+}
+
+function Get-ConnectorPorts { param($Connector) @(@($Connector.Bindings) | ForEach-Object { ("$_" -split ':')[-1] } | Where-Object { $_ } | Select-Object -Unique) }
+
+function Test-FrontendConnector {
+    param($Connector, [string]$Port)
+    ("$($Connector.TransportRole)" -match 'Frontend') -and ((Get-ConnectorPorts $Connector) -contains $Port)
+}
+
+# Builds the list of connector changes for the validated certificate.
+# Action: 'update' = pinned to the old certificate, 'pin' = frontend connector without a pinned certificate, 'none' = no change.
+function Get-ConnectorPlan {
+    Assert-Exchange; Assert-Validated
+    $servers = Get-SelectedServers
+    if (-not $servers) { throw 'Select at least one server on tab 1.' }
+    $new = $script:State.NewCert
+    if (-not $script:State.Inventory) { Update-Inventory }
+    $oldCerts = @($script:State.Inventory | Where-Object { $_.SelfSigned -ne 'True' -and $_.Thumbprint -ne $script:State.NewThumb })
+    $pinFrontend = [bool]$script:ui.PinFrontendCheck.IsChecked
+    $pinClient = [bool]$script:ui.PinClientCheck.IsChecked
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    $classify = {
+        param([string]$Tls)
+        if (Test-TlsNameMatches $Tls $new.Issuer $new.Subject) { return @('none', 'OK - already pinned to the new certificate (same issuer and subject)') }
+        if ($oldCerts | Where-Object { Test-TlsNameMatches $Tls $_.Issuer $_.Subject }) { return @('update', 'Pinned to the OLD certificate - will be switched to the new one') }
+        return @('none', 'Pinned to another certificate (not old, not new) - left alone')
+    }
+
+    try {
+        foreach ($c in @(Get-SendConnector)) {
+            $tls = "$($c.TlsCertificateName)"
+            if (-not $tls) { continue }
+            $a = & $classify $tls
+            $rows.Add([pscustomobject]@{ Action = $a[0]; Type = 'Send'; Server = (@($c.SourceTransportServers | ForEach-Object { "$_" }) -join ','); Connector = "$($c.Identity)"
+                    Ports = ''; Fqdn = "$($c.Fqdn)"; Current = $tls; Note = $a[1] })
+        }
+    }
+    catch { Write-Log "Get-SendConnector failed: $($_.Exception.Message)" WARN }
+
+    foreach ($s in $servers) {
+        try { $conns = @(Get-ReceiveConnector -Server $s) }
+        catch { Write-Log "${s}: Get-ReceiveConnector failed: $($_.Exception.Message)" WARN; continue }
+        foreach ($c in $conns) {
+            $tls = "$($c.TlsCertificateName)"
+            $ports = Get-ConnectorPorts $c
+            $is25 = Test-FrontendConnector $c '25'
+            $is587 = Test-FrontendConnector $c '587'
+            if ($tls) { $a = & $classify $tls }
+            elseif ($is25 -or $is587) {
+                $fqdn = "$($c.Fqdn)"
+                if ($fqdn -and (Test-HostCovered -HostName $fqdn -CertNames $script:State.NewNames)) {
+                    $a = @('none', "OK - FQDN $fqdn is on the new certificate, so Exchange selects it automatically")
+                }
+                elseif (($is25 -and $pinFrontend) -or ($is587 -and $pinClient)) {
+                    $a = @('pin', "Not pinned; FQDN $fqdn is not on the new certificate, so STARTTLS currently offers the server's own (usually self-signed) certificate - will pin the new one")
+                }
+                else { $a = @('none', "Not pinned; STARTTLS offers the certificate matching FQDN $fqdn (usually self-signed). Tick the option above to pin the new certificate.") }
+            }
+            else { continue }
+            $rows.Add([pscustomobject]@{ Action = $a[0]; Type = 'Receive'; Server = $s; Connector = "$($c.Identity)"; Ports = ($ports -join ',')
+                    Fqdn = "$($c.Fqdn)"; Current = $(if ($tls) { $tls } else { '(none)' }); Note = $a[1] })
+        }
+    }
+    $rows.ToArray()
+}
+
+function Show-ConnectorPlan {
+    param([object[]]$Plan)
+    $script:ui.ConnectorGrid.ItemsSource = (ConvertTo-DataTable $Plan @('Action', 'Type', 'Server', 'Connector', 'Ports', 'Fqdn', 'Current', 'Note')).DefaultView
+    $n = @($Plan | Where-Object { $_.Action -ne 'none' }).Count
+    Write-Log ("Connector plan: {0} connector(s) listed, {1} to change." -f @($Plan).Count, $n)
+}
+
+function Update-ConnectorPreview { Show-ConnectorPlan -Plan @(Get-ConnectorPlan) }
+
+function Invoke-UpdateConnectors {
+    $plan = @(Get-ConnectorPlan)
+    Show-ConnectorPlan -Plan $plan
+    $todo = @($plan | Where-Object { $_.Action -ne 'none' })
+    if (-not $todo) { Write-Log 'No connector needs a change.' OK; return }
+    $new = $script:State.NewCert
+    $thumb = $script:State.NewThumb
+    $tlsNew = "<I>$($new.Issuer)<S>$($new.Subject)"
+
+    # The certificate must be on the server and enabled for SMTP, or STARTTLS breaks (event 12014).
+    $readyCache = @{}
+    $isReady = {
+        param([string]$Server)
+        if (-not $readyCache.ContainsKey($Server)) {
+            $c = Get-ExchangeCertSafe -Server $Server -Thumbprint $thumb
+            $readyCache[$Server] = [bool]($c -and ((Get-ServiceList $c) -contains 'SMTP'))
+        }
+        $readyCache[$Server]
+    }
+    $blocked = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $todo) {
+        $srvs = @($r.Server -split ',' | Where-Object { $_ })
+        $notReady = @($srvs | Where-Object { -not (& $isReady $_) })
+        if ($notReady) { $blocked.Add([pscustomobject]@{ Row = $r; Servers = $notReady }) }
+    }
+    if ($blocked.Count) {
+        foreach ($b in $blocked) {
+            Write-Log "$($b.Row.Connector): the new certificate is not enabled for SMTP on $($b.Servers -join ', ') yet - run Step A and Step B first$(if (Test-DryRun) { ' (dry run continues)' })." $(if (Test-DryRun) { 'WARN' } else { 'ERROR' })
+        }
+        if (-not (Test-DryRun)) { $todo = @($todo | Where-Object { $_ -notin @($blocked | ForEach-Object { $_.Row }) }) }
+        if (-not $todo) { throw 'No connector can be changed until the new certificate is enabled for SMTP on the servers (tab 3, Step B).' }
+    }
+
+    $list = ($todo | ForEach-Object { "  [$($_.Action)] $($_.Type) $($_.Connector)" }) -join "`n"
+    $msg = "Set TlsCertificateName on these connectors to:`n  $tlsNew`n`n$list`n`nThe previous values are written to the log as rollback commands."
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+    if (-not (Confirm-Action $msg 'Update SMTP connectors')) { Write-Log 'Connector update cancelled.' WARN; return }
+
+    $q = { param([string]$s) "'" + ($s -replace "'", "''") + "'" }
+    foreach ($r in $todo) {
+        $cmd = if ($r.Type -eq 'Send') { 'Set-SendConnector' } else { 'Set-ReceiveConnector' }
+        $prev = if ($r.Current -and $r.Current -ne '(none)') { & $q $r.Current } else { '$null' }
+        Write-Log "Rollback for $($r.Connector): $cmd -Identity $(& $q $r.Connector) -TlsCertificateName $prev"
+        try {
+            Invoke-Step "$cmd -Identity $(& $q $r.Connector) -TlsCertificateName $(& $q $tlsNew)" {
+                if ($r.Type -eq 'Send') {
+                    Set-SendConnector -Identity $r.Connector -TlsCertificateName $tlsNew -ErrorAction Stop
+                    $now = "$((Get-SendConnector -Identity $r.Connector).TlsCertificateName)"
+                }
+                else {
+                    Set-ReceiveConnector -Identity $r.Connector -TlsCertificateName $tlsNew -ErrorAction Stop
+                    $now = "$((Get-ReceiveConnector -Identity $r.Connector).TlsCertificateName)"
+                }
+                if (Test-TlsNameMatches $now $new.Issuer $new.Subject) { Write-Log "$($r.Connector): now uses the new certificate." OK }
+                else { Write-Log "$($r.Connector): TlsCertificateName is '$now' after the change - check it manually." ERROR }
+            }
+        }
+        catch { Write-Log "$($r.Connector): update FAILED: $($_.Exception.Message)" ERROR }
+    }
+    if (-not (Test-DryRun)) {
+        Show-ConnectorPlan -Plan @(Get-ConnectorPlan)
+        Write-Log 'Transport picks up connector changes automatically within a few minutes. Then run tab 4 (Verify) - SMTP port 25 should serve the new certificate.' INFO
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
 # Step 2: validate PFX
 # ---------------------------------------------------------------------------------------------
 function Reset-Validation {
@@ -547,7 +698,7 @@ function Invoke-ValidatePfx {
             & $out ("  {0} connector '{1}'" -f $c.Type, $c.Identity)
             & $out ("      TlsCertificateName: {0}" -f $c.Tls)
             & $out ("      {0}" -f $c.Status)
-            if (-not $c.MatchesNew) { & $out ("      To point it at the new cert (run manually after enabling): {0}" -f $c.FixCommand) }
+            if (-not $c.MatchesNew) { & $out ("      Fix (tab 3, Step C does this for you): {0}" -f $c.FixCommand) }
         }
         if ($conns | Where-Object { $_.Status -like 'ACTION*' }) { $warnings.Add('One or more connectors pin the OLD certificate - see the connector section.') }
         & $out ''
@@ -576,7 +727,12 @@ function Invoke-ValidatePfx {
     $script:ui.ValidationBox.Text = $report
     foreach ($l in ($report -split "`r?`n")) { if ($l) { Add-Content -LiteralPath $script:LogFile -Value "    | $l" -Encoding UTF8 } }
     if ($errors.Count) { Write-Log "Validation FAILED: $($errors -join ' ')" ERROR }
-    else { Write-Log ("Validation passed for {0} ({1} warning(s))." -f $leaf.Thumbprint, $warnings.Count) OK }
+    else {
+        Write-Log ("Validation passed for {0} ({1} warning(s))." -f $leaf.Thumbprint, $warnings.Count) OK
+        if ((Test-ExchangeAvailable) -and (Get-SelectedServers)) {
+            try { Update-ConnectorPreview } catch { Write-Log "Connector preview failed: $($_.Exception.Message)" WARN }
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -698,9 +854,18 @@ function Invoke-Verify {
 
         try {
             $r = Get-RemoteTlsCertificate -HostName $fqdn -Port 25 -SniName $fqdn -StartTls
+            $pinnedNew = $false
+            try {
+                $pinnedNew = [bool](@(Get-ReceiveConnector -Server $s) | Where-Object {
+                        (Test-FrontendConnector $_ '25') -and (Test-TlsNameMatches "$($_.TlsCertificateName)" $script:State.NewCert.Issuer $script:State.NewCert.Subject) })
+            }
+            catch { }
             if ($r.Thumbprint -eq $thumb) { & $addRow $s "SMTP ${fqdn}:25 STARTTLS" 'PASS' "Served new certificate ($($r.Protocol))" }
+            elseif ($pinnedNew) {
+                & $addRow $s "SMTP ${fqdn}:25 STARTTLS" 'FAIL' ("Served $($r.Thumbprint) ($($r.Subject)), but Default Frontend is pinned to the new certificate. Transport reloads connector settings after a few minutes - verify again; if it persists, restart MSExchangeFrontEndTransport in a quiet period.")
+            }
             else {
-                & $addRow $s "SMTP ${fqdn}:25 STARTTLS" 'INFO' ("Served $($r.Thumbprint) ($($r.Subject)). Normal when the receive connector FQDN is the server's own name (Exchange then picks the certificate matching that name). Internet SMTP uses the name on your public MX connector.")
+                & $addRow $s "SMTP ${fqdn}:25 STARTTLS" 'INFO' ("Served $($r.Thumbprint) ($($r.Subject)). Default Frontend is not pinned to the new certificate, so Exchange offers the certificate matching the connector FQDN (usually self-signed). Use tab 3, Step C to pin the new certificate for internet senders.")
             }
         }
         catch { & $addRow $s "SMTP ${fqdn}:25 STARTTLS" 'INFO' "Could not probe: $($_.Exception.Message)" }
@@ -1841,6 +2006,7 @@ function Show-LePluginParams {
       </TabItem>
 
       <TabItem Header="3. Import &amp; enable">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
         <StackPanel Margin="12">
           <TextBlock TextWrapping="Wrap" Text="Step A imports the validated PFX into every selected server (the same PFX on each server, so all get the identical certificate and private key). Step B enables it for IIS and SMTP. The Exchange Back End website (port 444) keeps its self-signed certificate. Nothing is removed here - the old certificate stays until tab 5."/>
           <CheckBox x:Name="ExportableCheck" Margin="0,14,0,0" Content="Mark private key as exportable on the servers (only if you need to export it from Exchange later)"/>
@@ -1850,8 +2016,19 @@ function Show-LePluginParams {
             <Button x:Name="EnableButton" Content="Step B: Enable for IIS + SMTP"/>
           </StackPanel>
           <TextBlock Margin="0,18,0,0" TextWrapping="Wrap" Foreground="DimGray"
-                     Text="Recommended: run both steps once with 'Dry run' ticked and read the log, then untick 'Dry run' and run them for real. Connectors that pin the old certificate (listed on tab 2) are reported only - update them manually with the command shown."/>
+                     Text="Recommended: run every step once with 'Dry run' ticked and read the log, then untick 'Dry run' and run them for real."/>
+          <TextBlock Margin="0,22,0,4" FontWeight="Bold" Text="Step C: SMTP connectors (TlsCertificateName)"/>
+          <TextBlock TextWrapping="Wrap" Foreground="DimGray"
+                     Text="Updates Send/Receive connectors that are pinned to the old certificate (e.g. hybrid 'Outbound to Office 365' and 'Default Frontend' set by the HCW), and can pin the new certificate on the frontend receive connectors. Without a pinned certificate, the 'Default Frontend' connector offers the certificate that matches its FQDN - usually the server's self-signed one - to internet senders. The connector FQDN is never changed (that can break Kerberos between Exchange servers). Run after Step B."/>
+          <CheckBox x:Name="PinFrontendCheck" Margin="0,8,0,0" IsChecked="True" Content="Pin the new certificate on 'Default Frontend' receive connectors (port 25, internet mail / STARTTLS)"/>
+          <CheckBox x:Name="PinClientCheck" Margin="0,4,0,0" Content="Also pin it on 'Client Frontend' receive connectors (port 587, authenticated SMTP submission)"/>
+          <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+            <Button x:Name="ConnectorPreviewButton" Content="Preview connector changes"/>
+            <Button x:Name="ConnectorUpdateButton" Content="Step C: Update connectors"/>
+          </StackPanel>
+          <DataGrid x:Name="ConnectorGrid" Height="190"/>
         </StackPanel>
+        </ScrollViewer>
       </TabItem>
 
       <TabItem Header="4. Verify">
@@ -1902,7 +2079,7 @@ function New-MainWindow {
     $script:ui = $map
 }
 
-$script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'ImportButton', 'EnableButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
+$script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'ImportButton', 'EnableButton', 'ConnectorPreviewButton', 'ConnectorUpdateButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
 'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeCfTestButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
@@ -1949,6 +2126,8 @@ function Register-UiEvents {
     $ui.ValidateButton.Add_Click({ Invoke-UiAction 'Validate' { Invoke-ValidatePfx } })
     $ui.ImportButton.Add_Click({ Invoke-UiAction 'Import' { Invoke-ImportCertificate } })
     $ui.EnableButton.Add_Click({ Invoke-UiAction 'Enable' { Invoke-EnableCertificate } })
+    $ui.ConnectorPreviewButton.Add_Click({ Invoke-UiAction 'Connector preview' { Update-ConnectorPreview } })
+    $ui.ConnectorUpdateButton.Add_Click({ Invoke-UiAction 'Update connectors' { Invoke-UpdateConnectors } })
     $ui.VerifyButton.Add_Click({ Invoke-UiAction 'Verify' { Invoke-Verify } })
     $ui.LoadOldButton.Add_Click({ Invoke-UiAction 'Load candidates' { Update-OldCandidates } })
     $ui.RemoveButton.Add_Click({ Invoke-UiAction 'Remove' { Invoke-RemoveOld } })
