@@ -30,17 +30,55 @@
     "Dry run" is ON by default: every command is written to the log and nothing is changed.
     Every action is logged to .\logs\CertSwap_<timestamp>.log.
 
+    Also: Auth (OAuth) certificate check/renewal (tab 1), CSR for commercial/internal CAs (tab 2),
+    POP/IMAP, rollback snapshots and an Edge Transport package (tab 3), rolling restart (tab 4),
+    and unattended ACME renewal for a scheduled task (-Renew).
+
 .PARAMETER LogDirectory
     Folder for log files. Default: <script folder>\logs
 
 .PARAMETER LoadOnly
     Define functions and build the window without connecting to Exchange or showing it.
     For testing:  . .\ExchangeCertTool.ps1 -LoadOnly
+
+.PARAMETER Renew
+    Unattended renewal (scheduled task): when the current IIS certificate has fewer than -RenewDays left,
+    requests a new ACME certificate with the settings saved by the last successful request in the GUI
+    (same Windows user), validates it and runs Step A, B, C and Verify. Dry run unless -Live is given.
+
+.PARAMETER Live
+    With -Renew: make the changes (without it, -Renew only logs what it would do).
+
+.PARAMETER RemoveOld
+    With -Renew: remove the previous IIS certificate after every server passed verification.
+
+.PARAMETER RenewDays
+    With -Renew: renew when the current certificate has fewer days left than this. Default 30.
+
+.PARAMETER ForceRenew
+    With -Renew: renew now, regardless of the days left.
+
+.PARAMETER NotifyTo
+    With -Renew: e-mail address(es) that receive the run's log when a renewal ran or failed.
+
+.PARAMETER NotifyFrom
+    With -Renew: sender address. Default: ExchangeCertTool@<default accepted domain>.
+
+.PARAMETER SmtpServer
+    With -Renew: SMTP server for the report. Default: localhost (the Exchange server itself).
 #>
 [CmdletBinding()]
 param(
     [string]$LogDirectory,
-    [switch]$LoadOnly
+    [switch]$LoadOnly,
+    [switch]$Renew,
+    [switch]$Live,
+    [switch]$RemoveOld,
+    [int]$RenewDays = 30,
+    [switch]$ForceRenew,
+    [string[]]$NotifyTo,
+    [string]$NotifyFrom,
+    [string]$SmtpServer = 'localhost'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +90,7 @@ if ($PSVersionTable.PSEdition -eq 'Core') {
 
 # WPF needs an STA thread. powershell.exe 5.1 is STA by default; relaunch if not.
 if (-not $LoadOnly -and [Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    if ($Renew) { throw 'Run -Renew in an STA host: powershell.exe -STA -File .\ExchangeCertTool.ps1 -Renew ...' }
     $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-LogDirectory', "`"$LogDirectory`"")
     Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $argList
     return
@@ -75,12 +114,16 @@ $script:State = @{
     MissingHosts = @()
     Verified     = @{}      # server -> $true when Exchange + HTTPS checks passed
     StagingThumbs = @()     # certificates issued by a staging ACME server in this session
+    AuthOtherThumbs = @()   # previous / next Auth certificate (Get-AuthConfig)
+    BlockingIssues = @()    # validation findings that would break mail flow (stop -Renew)
 }
 $script:ui = $null
 $script:Window = $null
+$script:Unattended = $false   # -Renew: no dialogs, confirmations are automatic
+$script:ErrorCount = 0        # ERROR lines written so far (-Renew stops on new errors)
 
 if (-not (Test-Path -LiteralPath $LogDirectory)) { New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null }
-$script:LogFile = Join-Path $LogDirectory ('CertSwap_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
+$script:LogFile = Join-Path $LogDirectory ('{0}_{1:yyyyMMdd_HHmmss}.log' -f $(if ($Renew) { 'CertRenew' } else { 'CertSwap' }), (Get-Date))
 
 function Update-Ui {
     if ($script:Window) {
@@ -95,7 +138,8 @@ function Write-Log {
     )
     $line = '{0:yyyy-MM-dd HH:mm:ss} [{1,-5}] {2}' -f (Get-Date), $Level, $Message
     Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8
-    if ($script:ui -and $script:ui.LogBox) {
+    if ($Level -eq 'ERROR') { $script:ErrorCount++ }
+    if ($script:ui -and $script:ui.LogBox -and -not $script:Unattended) {
         $script:ui.LogBox.AppendText($line + "`r`n")
         $script:ui.LogBox.ScrollToEnd()
         Update-Ui
@@ -142,6 +186,7 @@ function ConvertTo-DataTable {
 
 function Confirm-Action {
     param([string]$Message, [string]$Title = 'Confirm')
+    if ($script:Unattended) { Write-Log "$Title - confirmed automatically (unattended run)."; return $true }
     if (-not $script:Window) { return $false }
     $r = [System.Windows.MessageBox]::Show($script:Window, $Message, $Title,
         [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
@@ -200,6 +245,97 @@ function ConvertTo-NormalizedDn {
     param([string]$Dn)
     if (-not $Dn) { return '' }
     return ((($Dn -split '\s*,\s*') -join ',').Trim()).ToLowerInvariant()
+}
+
+# One DER element at $Offset: tag, start of its content, end (exclusive).
+function Get-DerElement {
+    param([byte[]]$Bytes, [int]$Offset)
+    $len = [int]$Bytes[$Offset + 1]; $hdr = 2
+    if ($len -band 0x80) {
+        $n = $len -band 0x7F; $len = 0
+        for ($k = 0; $k -lt $n; $k++) { $len = ($len * 256) + $Bytes[$Offset + 2 + $k] }
+        $hdr += $n
+    }
+    [pscustomobject]@{ Tag = [int]$Bytes[$Offset]; Start = $Offset; Content = $Offset + $hdr; End = $Offset + $hdr + $len }
+}
+
+# DER SubjectPublicKeyInfo of a certificate (what DANE selector 1 hashes); .NET Framework has no API for it.
+function Get-CertSpki {
+    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    $b = $Certificate.RawData
+    $p = (Get-DerElement $b (Get-DerElement $b 0).Content).Content          # into Certificate, then TBSCertificate
+    if ((Get-DerElement $b $p).Tag -eq 0xA0) { $p = (Get-DerElement $b $p).End }   # [0] version
+    for ($k = 0; $k -lt 5; $k++) { $p = (Get-DerElement $b $p).End }      # serial, signature, issuer, validity, subject
+    $spki = Get-DerElement $b $p
+    , [byte[]]$b[$spki.Start..($spki.End - 1)]
+}
+
+function ConvertTo-HexString { param([byte[]]$Bytes) [BitConverter]::ToString($Bytes) -replace '-', '' }
+
+# TLSA data as returned by DNS-over-HTTPS: "3 1 1 ab12..." (Google), "3 1 1 ( AB12... )" (Cloudflare), "\# 35 030101ab..." (RFC 3597).
+function ConvertFrom-TlsaData {
+    param([string]$Data)
+    $d = "$Data".Trim()
+    if ($d -match '^\\#\s+\d+\s+([0-9A-Fa-f\s]+)$') {
+        $hex = $Matches[1] -replace '\s', ''
+        if ($hex.Length -lt 8) { return $null }
+        return [pscustomobject]@{ Usage = [Convert]::ToInt32($hex.Substring(0, 2), 16); Selector = [Convert]::ToInt32($hex.Substring(2, 2), 16)
+            MatchType = [Convert]::ToInt32($hex.Substring(4, 2), 16); Data = $hex.Substring(6).ToUpperInvariant() }
+    }
+    if ($d -match '^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$') {
+        return [pscustomobject]@{ Usage = [int]$Matches[1]; Selector = [int]$Matches[2]; MatchType = [int]$Matches[3]; Data = ($Matches[4] -replace '[\s()]', '').ToUpperInvariant() }
+    }
+    $null
+}
+
+# True when a TLSA record matches: usage 1/3 = the certificate itself, 0/2 = a CA certificate of its chain.
+function Test-TlsaMatch {
+    param($Record, [System.Security.Cryptography.X509Certificates.X509Certificate2]$Leaf, [object[]]$CaCerts)
+    $targets = if ($Record.Usage -in 1, 3) { @($Leaf) } else { @($CaCerts) }
+    foreach ($c in $targets) {
+        if (-not $c) { continue }
+        [byte[]]$data = if ($Record.Selector -eq 1) { Get-CertSpki $c } else { $c.RawData }
+        $value = switch ($Record.MatchType) {
+            0 { ConvertTo-HexString $data }
+            1 { ConvertTo-HexString ([System.Security.Cryptography.SHA256]::Create().ComputeHash($data)) }
+            2 { ConvertTo-HexString ([System.Security.Cryptography.SHA512]::Create().ComputeHash($data)) }
+            default { $null }
+        }
+        if ($value -and $value -eq $Record.Data) { return $true }
+    }
+    $false
+}
+
+# Public TLSA records via DNS-over-HTTPS (Resolve-DnsName cannot query TLSA). Empty array = none, $null = lookup failed.
+function Get-PublicTlsa {
+    param([Parameter(Mandatory)][string]$Name)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $n = [uri]::EscapeDataString($Name)
+    foreach ($u in "https://dns.google/resolve?name=$n&type=TLSA", "https://cloudflare-dns.com/dns-query?name=$n&type=TLSA") {
+        try {
+            $r = Invoke-RestMethod -Uri $u -Headers @{ Accept = 'application/dns-json' } -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+            return , @(@($r.Answer) | Where-Object { $_ -and [int]$_.type -eq 52 } | ForEach-Object { ConvertFrom-TlsaData "$($_.data)" } | Where-Object { $_ })
+        }
+        catch { }
+    }
+    $null
+}
+
+# X509Certificate2 (public part only) of an Exchange certificate object - live, or deserialized with RawData.
+function ConvertTo-X509 {
+    param($ExCert)
+    if (-not $ExCert) { return $null }
+    if ($ExCert -is [System.Security.Cryptography.X509Certificates.X509Certificate2]) { return $ExCert }
+    try { if ($ExCert.RawData) { return (New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (, [byte[]]$ExCert.RawData)) } } catch { }
+    $null
+}
+
+# EKU OIDs of a certificate; 'any' when it has no EKU extension (valid for every purpose).
+function Get-CertEkus {
+    param([System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+    $e = $Certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.37' } | Select-Object -First 1
+    if (-not $e) { return , @('any') }
+    , @($e.EnhancedKeyUsages | ForEach-Object { $_.Value })
 }
 
 function Get-RemoteTlsCertificate {
@@ -262,6 +398,7 @@ function Get-RemoteTlsCertificate {
                 Protocol     = "$($ssl.SslProtocol)"
                 PolicyErrors = "$($script:__tlsPolicyErrors)"
                 Banner       = $banner
+                Certificate  = $remote
             }
         }
         finally { $ssl.Dispose() }
@@ -296,6 +433,18 @@ function Get-ExchangeCertSafe {
     try { return (Get-ExchangeCertificate -Server $Server -Thumbprint $Thumbprint -ErrorAction Stop) } catch { return $null }
 }
 
+function Get-ServerFqdn {
+    param([string]$Server)
+    if ($script:State.Servers.ContainsKey($Server) -and $script:State.Servers[$Server].Fqdn) { return $script:State.Servers[$Server].Fqdn }
+    $Server
+}
+
+# The hybrid configuration object, or $null when the organization is not hybrid.
+function Get-HybridConfigSafe {
+    if (-not (Get-Command Get-HybridConfiguration -ErrorAction SilentlyContinue)) { return $null }
+    try { Get-HybridConfiguration -ErrorAction Stop } catch { $null }
+}
+
 function Update-ServerList {
     Assert-Exchange
     $servers = @(Get-ExchangeServer | Where-Object { "$($_.ServerRole)" -match 'Mailbox' } | Sort-Object Name)
@@ -315,8 +464,11 @@ function Update-Inventory {
     Assert-Exchange
     $servers = Get-SelectedServers
     if (-not $servers) { throw 'Select at least one server on tab 1.' }
+    $authConfig = $null
     try {
-        $script:State.AuthThumb = "$((Get-AuthConfig).CurrentCertificateThumbprint)"
+        $authConfig = Get-AuthConfig
+        $script:State.AuthThumb = "$($authConfig.CurrentCertificateThumbprint)"
+        $script:State.AuthOtherThumbs = @("$($authConfig.PreviousCertificateThumbprint)", "$($authConfig.NextCertificateThumbprint)" | Where-Object { $_ })
         Write-Log "Auth (OAuth) certificate: $($script:State.AuthThumb)"
     }
     catch { Write-Log "Get-AuthConfig failed: $($_.Exception.Message)" WARN }
@@ -356,6 +508,26 @@ function Update-Inventory {
     $script:State.Inventory = $rows.ToArray()
     $script:ui.InventoryGrid.ItemsSource = (ConvertTo-DataTable $rows.ToArray() @('Server', 'Thumbprint', 'Subject', 'Services', 'NotAfter', 'DaysLeft', 'SelfSigned', 'Role', 'Issuer', 'Domains')).DefaultView
     Write-Log ("Inventory: {0} certificate(s) on {1} server(s)." -f $rows.Count, $servers.Count) OK
+    if ($authConfig) { Test-AuthCertificate -Rows $rows.ToArray() -Servers $servers -AuthConfig $authConfig }
+}
+
+# Logs the Auth (OAuth) certificate's expiry and the servers that miss it.
+function Test-AuthCertificate {
+    param([object[]]$Rows, [string[]]$Servers, $AuthConfig)
+    $thumb = $script:State.AuthThumb
+    $fix = 'Use "Renew / copy Auth certificate" on tab 1.'
+    if (-not $thumb) { Write-Log "No Auth (OAuth) certificate is configured (Get-AuthConfig). OAuth (hybrid free/busy, OWA/ECP sign-in) needs one. $fix" WARN; return }
+    $have = @($Rows | Where-Object { $_.Thumbprint -eq $thumb })
+    $missing = @($Servers | Where-Object { $_ -notin @($have | ForEach-Object { $_.Server }) })
+    if ($have) {
+        $days = ($have | Measure-Object DaysLeft -Minimum).Minimum
+        $msg = 'Auth (OAuth) certificate expires {0:yyyy-MM-dd} ({1} days left).' -f $have[0].NotAfter, $days
+        if ($days -lt 0) { Write-Log "$msg EXPIRED: OAuth fails (hybrid free/busy, OWA/ECP sign-in). $fix" ERROR }
+        elseif ($days -lt 60) { Write-Log "$msg Renew it soon. $fix" WARN }
+        else { Write-Log $msg }
+    }
+    if ($missing) { Write-Log "The Auth (OAuth) certificate $thumb is missing on $($missing -join ', '): OAuth fails on those servers. $fix" WARN }
+    if ("$($AuthConfig.NextCertificateThumbprint)") { Write-Log ('Next Auth certificate {0} is staged, effective {1}.' -f $AuthConfig.NextCertificateThumbprint, $AuthConfig.NextCertificateEffectiveDate) }
 }
 
 function Get-ExchangeHostNames {
@@ -407,6 +579,8 @@ function Get-ConnectorTlsReport {
         }
         catch { Write-Log "${s}: Get-ReceiveConnector failed: $($_.Exception.Message)" WARN }
     }
+    $hc = Get-HybridConfigSafe
+    if ($hc -and "$($hc.TlsCertificateName)") { $items.Add([pscustomobject]@{ Type = 'Hybrid'; Identity = 'HybridConfiguration'; Tls = "$($hc.TlsCertificateName)" }) }
     foreach ($i in $items) {
         $issuer = ''; $subject = ''
         if ($i.Tls -match '^<I>(.*?)<S>(.*)$') { $issuer = $Matches[1]; $subject = $Matches[2] }
@@ -415,14 +589,18 @@ function Get-ConnectorTlsReport {
         $oldThumbs = @($OldCerts | Where-Object { ((ConvertTo-NormalizedDn $_.Issuer) + '|' + (ConvertTo-NormalizedDn $_.Subject)) -eq $key } |
                 Select-Object -ExpandProperty Thumbprint -Unique)
         $tlsNew = ("<I>{0}<S>{1}" -f $NewIssuer, $NewSubject) -replace "'", "''"
-        $setCmd = if ($i.Type -eq 'Send') { 'Set-SendConnector' } else { 'Set-ReceiveConnector' }
         if ($matchNew) { $status = 'OK - new certificate has the same issuer/subject, Exchange will pick it up' }
         elseif ($oldThumbs) { $status = 'ACTION - pinned to the OLD certificate; update before removing the old one' }
         else { $status = 'INFO - references a different certificate (not old, not new)' }
+        $fix = switch ($i.Type) {
+            'Send' { "Set-SendConnector -Identity '{0}' -TlsCertificateName '{1}'" -f ($i.Identity -replace "'", "''"), $tlsNew }
+            'Hybrid' { "Set-HybridConfiguration -TlsCertificateName '{0}'" -f $tlsNew }
+            default { "Set-ReceiveConnector -Identity '{0}' -TlsCertificateName '{1}'" -f ($i.Identity -replace "'", "''"), $tlsNew }
+        }
         $i | Add-Member -NotePropertyName MatchesNew -NotePropertyValue $matchNew
         $i | Add-Member -NotePropertyName OldThumbprints -NotePropertyValue ($oldThumbs -join ',')
         $i | Add-Member -NotePropertyName Status -NotePropertyValue $status
-        $i | Add-Member -NotePropertyName FixCommand -NotePropertyValue ("{0} -Identity '{1}' -TlsCertificateName '{2}'" -f $setCmd, ($i.Identity -replace "'", "''"), $tlsNew)
+        $i | Add-Member -NotePropertyName FixCommand -NotePropertyValue $fix
     }
     $items.ToArray()
 }
@@ -474,6 +652,15 @@ function Get-ConnectorPlan {
         }
     }
     catch { Write-Log "Get-SendConnector failed: $($_.Exception.Message)" WARN }
+
+    # The HCW reads TlsCertificateName from the hybrid configuration when it (re)configures the connectors.
+    $hc = Get-HybridConfigSafe
+    if ($hc -and "$($hc.TlsCertificateName)") {
+        $tls = "$($hc.TlsCertificateName)"
+        $a = & $classify $tls
+        $rows.Add([pscustomobject]@{ Action = $a[0]; Type = 'Hybrid'; Server = ''; Connector = 'HybridConfiguration'; Ports = ''; Fqdn = ''; Current = $tls
+                Note = "$($a[1]) (Hybrid Configuration Wizard setting)" })
+    }
 
     foreach ($s in $servers) {
         try { $conns = @(Get-ReceiveConnector -Server $s) }
@@ -548,17 +735,23 @@ function Invoke-UpdateConnectors {
     $msg = "Set TlsCertificateName on these connectors to:`n  $tlsNew`n`n$list`n`nThe previous values are written to the log as rollback commands."
     if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
     if (-not (Confirm-Action $msg 'Update SMTP connectors')) { Write-Log 'Connector update cancelled.' WARN; return }
+    try { Save-ChangeSnapshot -Before 'StepC' } catch { Write-Log "Could not save the rollback snapshot: $($_.Exception.Message)" WARN }
 
     $q = { param([string]$s) "'" + ($s -replace "'", "''") + "'" }
     foreach ($r in $todo) {
-        $cmd = if ($r.Type -eq 'Send') { 'Set-SendConnector' } else { 'Set-ReceiveConnector' }
+        $cmd = switch ($r.Type) { 'Send' { 'Set-SendConnector' } 'Hybrid' { 'Set-HybridConfiguration' } default { 'Set-ReceiveConnector' } }
+        $idArg = if ($r.Type -eq 'Hybrid') { '' } else { " -Identity $(& $q $r.Connector)" }
         $prev = if ($r.Current -and $r.Current -ne '(none)') { & $q $r.Current } else { '$null' }
-        Write-Log "Rollback for $($r.Connector): $cmd -Identity $(& $q $r.Connector) -TlsCertificateName $prev"
+        Write-Log "Rollback for $($r.Connector): $cmd$idArg -TlsCertificateName $prev"
         try {
-            Invoke-Step "$cmd -Identity $(& $q $r.Connector) -TlsCertificateName $(& $q $tlsNew)" {
+            Invoke-Step "$cmd$idArg -TlsCertificateName $(& $q $tlsNew)" {
                 if ($r.Type -eq 'Send') {
                     Set-SendConnector -Identity $r.Connector -TlsCertificateName $tlsNew -ErrorAction Stop
                     $now = "$((Get-SendConnector -Identity $r.Connector).TlsCertificateName)"
+                }
+                elseif ($r.Type -eq 'Hybrid') {
+                    Set-HybridConfiguration -TlsCertificateName $tlsNew -ErrorAction Stop
+                    $now = "$((Get-HybridConfiguration).TlsCertificateName)"
                 }
                 else {
                     Set-ReceiveConnector -Identity $r.Connector -TlsCertificateName $tlsNew -ErrorAction Stop
@@ -574,6 +767,81 @@ function Invoke-UpdateConnectors {
         Show-ConnectorPlan -Plan @(Get-ConnectorPlan)
         Write-Log 'Transport picks up connector changes automatically within a few minutes. Then run tab 4 (Verify) - SMTP port 25 should serve the new certificate.' INFO
     }
+}
+
+# Read-only checks that protect mail flow when the certificate changes: Client Authentication EKU, the name
+# Exchange Online checks on hybrid mail, MX names that would drop off the certificate, and DANE TLSA records.
+# Findings that would break mail flow also go to $script:State.BlockingIssues (they stop -Renew).
+function Add-MailFlowChecks {
+    param([System.Text.StringBuilder]$Report, $Warnings, [System.Security.Cryptography.X509Certificates.X509Certificate2]$Leaf, [object[]]$ExtraCerts, [string[]]$Names)
+    $out = { param([string]$t = '') [void]$Report.AppendLine($t) }
+    $block = { param([string]$m) $Warnings.Add($m); $script:State.BlockingIssues += $m }
+    & $out '=== MAIL FLOW (EKU, hybrid, MX, DANE) ==='
+    $old = @()
+    try { $old = @(Get-CurrentIisCertificates | Where-Object { -not $Leaf -or $_.Thumbprint -ne $Leaf.Thumbprint }) } catch { }
+    $oldNames = @($old | ForEach-Object { $_.Domains; if ("$($_.Subject)" -match '(?:^|,\s*)CN=([^,]+)') { $Matches[1].Trim() } } |
+        Where-Object { $_ } | ForEach-Object { "$_".ToLowerInvariant() } | Select-Object -Unique)
+
+    if ($Leaf) {
+        $ekus = Get-CertEkus $Leaf
+        $ekuText = if ($ekus -contains 'any') { '(no EKU extension = any purpose)' } else { (@($ekus | ForEach-Object { $f = (New-Object System.Security.Cryptography.Oid $_).FriendlyName; if ($f) { $f } else { $_ } }) -join ', ') }
+        & $out "  EKU: $ekuText"
+        if (-not (($ekus -contains '1.3.6.1.5.5.7.3.2') -or ($ekus -contains 'any'))) {
+            $oldHad = $false
+            foreach ($o in $old) {
+                $x = ConvertTo-X509 (Get-ExchangeCertSafe -Server @($o.Servers)[0] -Thumbprint $o.Thumbprint)
+                if ($x) { $e = Get-CertEkus $x; if (($e -contains '1.3.6.1.5.5.7.3.2') -or ($e -contains 'any')) { $oldHad = $true } }
+            }
+            if ($oldHad) { $Warnings.Add('The new certificate has no Client Authentication EKU, but the current one has. Exchange also presents this certificate as a client on outgoing SMTP, so partners that require mutual TLS (domain security) may reject it. Public CAs are phasing this EKU out.') }
+            else { & $out '  [INFO] No Client Authentication EKU (normal for current public certificates).' }
+        }
+    }
+
+    $hc = Get-HybridConfigSafe
+    if ($hc -and "$($hc.TlsCertificateName)" -match '<S>(.*)$') {
+        $subj = $Matches[1]
+        $cn = if ($subj -match '(?:^|,\s*)CN=([^,]+)') { $Matches[1].Trim().ToLowerInvariant() } else { $null }
+        $ok = if (-not $cn) { $true } elseif ($cn.StartsWith('*.')) { $Names -contains $cn } else { Test-HostCovered -HostName $cn -CertNames $Names }
+        if (-not $cn) { & $out '  [INFO] Hybrid configuration found, but its certificate subject has no CN.' }
+        elseif ($ok) { & $out "  [ OK ] Hybrid: $cn is on the new certificate (Exchange Online checks this name on mail from on-premises)." }
+        else { & $block "Hybrid: the new certificate does not contain $cn. The Exchange Online inbound connector for on-premises mail usually checks this name (TlsSenderCertificateName), so mail from on-premises to Exchange Online would be rejected. Add the name to the certificate, or change the connector in Exchange Online / rerun the Hybrid Configuration Wizard first." }
+    }
+
+    $ca = @()
+    if ($Leaf) {
+        $ch = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+        $ch.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        foreach ($e in @($ExtraCerts)) { if ($e) { [void]$ch.ChainPolicy.ExtraStore.Add($e) } }
+        try { [void]$ch.Build($Leaf); $ca = @($ch.ChainElements | Select-Object -Skip 1 | ForEach-Object { $_.Certificate }) } catch { }
+        $ca += @($ExtraCerts | Where-Object { $_ -and $_.Thumbprint -ne $Leaf.Thumbprint })
+    }
+    $domains = @()
+    try {
+        $domains = @(Get-AcceptedDomain | Where-Object { "$($_.DomainType)" -eq 'Authoritative' -and "$($_.DomainName)" -notmatch '\*' } |
+            ForEach-Object { "$($_.DomainName)".ToLowerInvariant() } | Where-Object { $_ -notmatch $script:LeInternalNamePattern } | Select-Object -First 20)
+    }
+    catch { Write-Log "Get-AcceptedDomain failed: $($_.Exception.Message)" WARN }
+    $doh = $true
+    foreach ($d in $domains) {
+        $mx = @(Resolve-PublicName -Name $d -Type MX | Where-Object { $_.Type -eq 'MX' } | ForEach-Object { "$($_.NameExchange)".TrimEnd('.').ToLowerInvariant() } | Select-Object -Unique)
+        foreach ($m in $mx) {
+            $onNew = Test-HostCovered -HostName $m -CertNames $Names
+            $onOld = $oldNames.Count -and (Test-HostCovered -HostName $m -CertNames $oldNames)
+            if ($onOld -and -not $onNew) { & $block "MX $m ($d) is on the current certificate but not on the new one. Senders that enforce TLS (MTA-STS, DANE, partner TLS) would fail once port 25 serves the new certificate."; continue }
+            if (-not $onNew) { continue }   # this MX is not these servers (e.g. Exchange Online Protection or a mail gateway)
+            if (-not $Leaf -or -not $doh) { continue }
+            $recs = Get-PublicTlsa "_25._tcp.$m"
+            if ($null -eq $recs) { $doh = $false; & $out '  [INFO] DANE check skipped: no HTTPS access to dns.google or cloudflare-dns.com.'; continue }
+            if (-not $recs.Count) { & $out "  [ OK ] MX $m ($d) is on the new certificate; no DANE TLSA records."; continue }
+            if (@($recs | Where-Object { Test-TlsaMatch -Record $_ -Leaf $Leaf -CaCerts $ca }).Count) { & $out "  [ OK ] DANE: a TLSA record of _25._tcp.$m matches the new certificate." }
+            else {
+                $hash = ConvertTo-HexString ([System.Security.Cryptography.SHA256]::Create().ComputeHash((Get-CertSpki $Leaf)))
+                & $block "DANE: no TLSA record of _25._tcp.$m matches the new certificate. Publish '_25._tcp.$m TLSA 3 1 1 $hash' next to the existing record and wait for its TTL before Step B/C, or senders that validate DANE (including Exchange Online) stop delivering mail for $d."
+            }
+        }
+    }
+    if (-not $domains) { & $out '  [INFO] No accepted domains to check MX/DANE for.' }
+    & $out ''
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -659,6 +927,10 @@ function Invoke-UseInstalledCertificate {
         }
         if ($missing) { $warnings.Add("Not covered by the certificate: $($missing -join ', ')") }
         & $out ''
+        $x509 = ConvertTo-X509 (Get-ExchangeCertSafe -Server @($c.Servers)[0] -Thumbprint $c.Thumbprint)
+        if (-not $x509) { & $out '(EKU and DANE checks skipped: the certificate data is not available from Exchange.)' }
+        try { Add-MailFlowChecks -Report $sb -Warnings $warnings -Leaf $x509 -Names $names }
+        catch { Write-Log "Mail flow checks failed: $($_.Exception.Message)" WARN }
     }
 
     & $out '=== RESULT ==='
@@ -734,6 +1006,7 @@ function Reset-Validation {
     $script:State.Validated = $false
     $script:State.NewCert = $null
     $script:State.NewThumb = $null
+    $script:State.BlockingIssues = @()
 }
 
 function Invoke-ValidatePfx {
@@ -852,6 +1125,8 @@ function Invoke-ValidatePfx {
         }
         if ($conns | Where-Object { $_.Status -like 'ACTION*' }) { $warnings.Add('One or more connectors pin the OLD certificate - see the connector section.') }
         & $out ''
+        try { Add-MailFlowChecks -Report $sb -Warnings $warnings -Leaf $leaf -ExtraCerts $others -Names $allNames }
+        catch { Write-Log "Mail flow checks failed: $($_.Exception.Message)" WARN }
     }
     else {
         & $out '(Exchange not available or no server selected - host name and connector checks skipped.)'
@@ -891,8 +1166,8 @@ function Invoke-ValidatePfx {
 # Step A when the certificate came from Exchange instead of a PFX: export it from a server that has it
 # (needs an exportable private key) and import it on the selected servers that do not.
 function Copy-InstalledCertificate {
-    param([string[]]$Servers, [bool]$Exportable)
-    $thumb = $script:State.NewThumb
+    param([string[]]$Servers, [bool]$Exportable, [string]$Thumbprint)
+    $thumb = if ($Thumbprint) { $Thumbprint } else { $script:State.NewThumb }
     $have = @(); $need = @()
     foreach ($s in $Servers) { if (Get-ExchangeCertSafe -Server $s -Thumbprint $thumb) { $have += $s } else { $need += $s } }
     if (-not $need) { Write-Log "Certificate $thumb is already on all selected servers - nothing to import. Continue with Step B / Step C." OK; return }
@@ -962,26 +1237,31 @@ function Invoke-EnableCertificate {
     if (-not $servers) { throw 'Select at least one server on tab 1.' }
     $thumb = $script:State.NewThumb
     $replaceInternal = [bool]$script:ui.ReplaceInternalCheck.IsChecked
+    $popImap = [bool]$script:ui.PopImapCheck.IsChecked
+    $services = @('IIS', 'SMTP') + @(if ($popImap) { 'POP', 'IMAP' })
 
     if (-not (Test-DryRun)) {
         $notImported = @($servers | Where-Object { -not (Get-ExchangeCertSafe -Server $_ -Thumbprint $thumb) })
         if ($notImported) { throw "Certificate is not imported on: $($notImported -join ', '). Run step A first." }
     }
-    $msg = "Enable certificate $thumb for IIS + SMTP on: $($servers -join ', ')`n`n" +
+    $msg = "Enable certificate $thumb for $($services -join ' + ') on: $($servers -join ', ')`n`n" +
     "- The HTTPS binding of the Default Web Site (443) switches to the new certificate immediately.`n" +
     "- The Exchange Back End site (444) is not touched.`n" +
     "- Internal transport certificate: $(if ($replaceInternal) { 'WILL BE REPLACED' } else { 'kept (restored if Exchange replaces it)' })`n" +
-    "- The old certificate stays on the servers."
+    $(if ($popImap) { "- POP3/IMAP4: X509CertificateName is set to a name on the certificate if needed, and the POP/IMAP services are restarted.`n" } else { '' }) +
+    "- The old certificate stays on the servers. The current configuration is saved first (tab 3, Roll back)."
     if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
     if (-not (Confirm-Action $msg 'Enable certificate')) { Write-Log 'Enable cancelled.' WARN; return }
+    try { Save-ChangeSnapshot -Before 'StepB' } catch { Write-Log "Could not save the rollback snapshot: $($_.Exception.Message)" WARN }
 
     foreach ($s in $servers) {
         try {
             $before = "$((Get-TransportService -Identity $s).InternalTransportCertificateThumbprint)"
             Write-Log "${s}: internal transport certificate before: $before"
-            Invoke-Step "Enable-ExchangeCertificate -Server $s -Thumbprint $thumb -Services IIS,SMTP -Force" {
-                Enable-ExchangeCertificate -Server $s -Thumbprint $thumb -Services IIS, SMTP -Force -ErrorAction Stop
+            Invoke-Step "Enable-ExchangeCertificate -Server $s -Thumbprint $thumb -Services $($services -join ',') -Force" {
+                Enable-ExchangeCertificate -Server $s -Thumbprint $thumb -Services $services -Force -ErrorAction Stop
             }
+            if ($popImap) { Set-PopImapCertificateName -Server $s }
             if (Test-DryRun) {
                 if (-not $replaceInternal) { Write-Log "[DRY RUN] ${s}: would restore internal transport certificate to $before if Enable-ExchangeCertificate replaced it." CMD }
                 continue
@@ -1004,8 +1284,33 @@ function Invoke-EnableCertificate {
     }
     if (-not (Test-DryRun)) {
         Update-Inventory
-        Write-Log 'Next: run tab 4 (Verify). Connectors pinned to the old certificate (see tab 2 report) must be updated manually.' INFO
+        Write-Log 'Next: tab 3 Step C (SMTP connectors), then tab 4 (Verify).' INFO
     }
+}
+
+# POP3/IMAP4 pick their certificate by X509CertificateName: point it at a name on the new certificate, then restart.
+function Set-PopImapCertificateName {
+    param([string]$Server)
+    $names = @($script:State.NewNames)
+    $target = @($names | Where-Object { $_ -notmatch '\*' } | Select-Object -First 1)[0]
+    if (-not $target) { $target = ($names | Select-Object -First 1) -replace '^\*\.', 'mail.' }
+    $changed = $false
+    foreach ($kind in 'Pop', 'Imap') {
+        try { $cur = "$((& "Get-${kind}Settings" -Server $Server -ErrorAction Stop).X509CertificateName)" }
+        catch { Write-Log "${Server}: Get-${kind}Settings failed: $($_.Exception.Message)" WARN; continue }
+        if ($cur -and (Test-HostCovered -HostName $cur -CertNames $names)) { Write-Log "${Server}: ${kind} X509CertificateName $cur is on the new certificate." OK; continue }
+        Write-Log "Rollback for ${Server} ${kind}: Set-${kind}Settings -Server $Server -X509CertificateName $(if ($cur) { $cur } else { '$null' })"
+        Invoke-Step "Set-${kind}Settings -Server $Server -X509CertificateName $target" { & "Set-${kind}Settings" -Server $Server -X509CertificateName $target -ErrorAction Stop }
+        $changed = $true
+    }
+    $fqdn = Get-ServerFqdn $Server
+    Invoke-Step "Restart the running POP3/IMAP4 services on $fqdn" {
+        foreach ($svc in @(Get-Service -ComputerName $fqdn -Name MSExchangePOP3, MSExchangePOP3BE, MSExchangeIMAP4, MSExchangeIMAP4BE -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Running' })) {
+            try { $svc | Restart-Service -Force -ErrorAction Stop; Write-Log "${Server}: restarted $($svc.Name)." OK }
+            catch { Write-Log "${Server}: could not restart $($svc.Name): $($_.Exception.Message)" WARN }
+        }
+    }
+    if (-not $changed) { Write-Log "${Server}: POP/IMAP certificate names unchanged." }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1060,6 +1365,18 @@ function Invoke-Verify {
         }
         catch { & $addRow $s "SMTP ${fqdn}:25 STARTTLS" 'INFO' "Could not probe: $($_.Exception.Message)" }
 
+        # POP3S / IMAPS only when the new certificate is enabled for them (informational, like SMTP).
+        foreach ($mp in @(@{ Svc = 'POP'; Port = 995; Cmd = 'Get-PopSettings' }, @{ Svc = 'IMAP'; Port = 993; Cmd = 'Get-ImapSettings' })) {
+            if (-not $c -or (Get-ServiceList $c) -notcontains $mp.Svc) { continue }
+            $check = "$($mp.Svc) ${fqdn}:$($mp.Port)"
+            try {
+                $r = Get-RemoteTlsCertificate -HostName $fqdn -Port $mp.Port -SniName $sni
+                if ($r.Thumbprint -eq $thumb) { & $addRow $s $check 'PASS' "Served new certificate ($($r.Protocol))" }
+                else { & $addRow $s $check 'FAIL' "Served $($r.Thumbprint) ($($r.Subject)) - check X509CertificateName ($($mp.Cmd)) and restart the service." }
+            }
+            catch { & $addRow $s $check 'INFO' "Could not probe (service stopped?): $($_.Exception.Message)" }
+        }
+
         try {
             $it = "$((Get-TransportService -Identity $s).InternalTransportCertificateThumbprint)"
             & $addRow $s 'Internal transport cert' 'INFO' $(if ($it -eq $thumb) { "Now the NEW certificate ($it)" } else { "Unchanged: $it" })
@@ -1076,7 +1393,9 @@ function Invoke-Verify {
         try {
             $r = Get-RemoteTlsCertificate -HostName $h -Port $p -SniName $h
             $ok = ($r.Thumbprint -eq $thumb)
-            & $addRow '(endpoint)' "TLS ${h}:$p" $(if ($ok) { 'PASS' } else { 'INFO' }) ("Served $($r.Thumbprint) ($($r.Subject))" + $(if (-not $ok) { ' - if the load balancer terminates TLS, it needs the new certificate separately.' } else { '' }))
+            # Extended Protection (default since Exchange 2019 CU14 / SE) binds Windows authentication to the TLS
+            # certificate: a load balancer that re-encrypts with a different certificate breaks Outlook/EWS sign-in.
+            & $addRow '(endpoint)' "TLS ${h}:$p" $(if ($ok) { 'PASS' } else { 'FAIL' }) ("Served $($r.Thumbprint) ($($r.Subject))" + $(if (-not $ok) { ' - NOT the new certificate. A load balancer or reverse proxy that terminates TLS needs the new certificate too. With Extended Protection (on by default since Exchange 2019 CU14 / SE), a different certificate on the load balancer breaks Windows authentication for Outlook, EWS and ActiveSync.' } else { '' }))
         }
         catch { & $addRow '(endpoint)' "TLS ${h}:$p" 'FAIL' $_.Exception.Message }
     }
@@ -1090,6 +1409,7 @@ function Invoke-Verify {
 # Step 5: remove old certificate
 # ---------------------------------------------------------------------------------------------
 function Update-OldCandidates {
+    param([switch]$PassThru)
     Assert-Exchange; Assert-Validated
     $servers = Get-SelectedServers
     Update-Inventory
@@ -1099,6 +1419,7 @@ function Update-OldCandidates {
         $blockers = @()
         if (-not $script:State.Verified[$c.Server]) { $blockers += 'server not verified on tab 4' }
         if ($c.Thumbprint -eq $script:State.AuthThumb) { $blockers += 'is the Auth certificate' }
+        if (@($script:State.AuthOtherThumbs) -contains $c.Thumbprint) { $blockers += 'is the previous/next Auth certificate (Get-AuthConfig)' }
         if ($c.Thumbprint -eq $script:State.Servers[$c.Server].InternalTransportThumb) { $blockers += 'is the internal transport certificate' }
         if ($c.Services -match 'IIS') { $blockers += 'still bound to IIS' }
         $pinned = @($conns | Where-Object { -not $_.MatchesNew -and ($_.OldThumbprints -split ',') -contains $c.Thumbprint })
@@ -1110,15 +1431,20 @@ function Update-OldCandidates {
     }
     $script:ui.OldGrid.ItemsSource = (ConvertTo-DataTable @($rows) @('Server', 'Thumbprint', 'Subject', 'NotAfter', 'Services', 'Removable', 'Blockers')).DefaultView
     Write-Log ("Old-certificate candidates: {0} (non-self-signed, not the new certificate)." -f @($rows).Count)
+    if ($PassThru) { @($rows) }
 }
 
 function Invoke-RemoveOld {
+    param([object[]]$Rows)   # rows from Update-OldCandidates (-Renew); default: the rows selected in the grid
     Assert-Exchange; Assert-Validated
-    $sel = @($script:ui.OldGrid.SelectedItems)
-    if (-not $sel) { throw 'Select one or more rows in the grid first.' }
-    $targets = @(foreach ($rv in $sel) {
-            [pscustomobject]@{ Server = "$($rv.Row['Server'])"; Thumbprint = "$($rv.Row['Thumbprint'])"; Subject = "$($rv.Row['Subject'])"; Blockers = "$($rv.Row['Blockers'])" }
-        })
+    if ($Rows) { $targets = @($Rows | ForEach-Object { [pscustomobject]@{ Server = "$($_.Server)"; Thumbprint = "$($_.Thumbprint)"; Subject = "$($_.Subject)"; Blockers = "$($_.Blockers)" } }) }
+    else {
+        $sel = @($script:ui.OldGrid.SelectedItems)
+        if (-not $sel) { throw 'Select one or more rows in the grid first.' }
+        $targets = @(foreach ($rv in $sel) {
+                [pscustomobject]@{ Server = "$($rv.Row['Server'])"; Thumbprint = "$($rv.Row['Thumbprint'])"; Subject = "$($rv.Row['Subject'])"; Blockers = "$($rv.Row['Blockers'])" }
+            })
+    }
     $blocked = @($targets | Where-Object { $_.Blockers })
     foreach ($b in $blocked) { Write-Log "$($b.Server): $($b.Thumbprint) NOT removable - $($b.Blockers)" WARN }
     $targets = @($targets | Where-Object { -not $_.Blockers })
@@ -1140,6 +1466,394 @@ function Invoke-RemoveOld {
         catch { Write-Log "$($t.Server): removal of $($t.Thumbprint) FAILED: $($_.Exception.Message)" ERROR }
     }
     Update-OldCandidates
+}
+
+# ---------------------------------------------------------------------------------------------
+# Auth (OAuth) certificate - tab 1
+# ---------------------------------------------------------------------------------------------
+# Copies the current Auth certificate to servers that miss it, or (fewer than 60 days left) creates a new one,
+# makes it current (Set-AuthConfig) and restarts the services that cache it. Follows Microsoft's documented procedure.
+function Invoke-AuthCertificate {
+    Assert-Exchange
+    $servers = @(Get-SelectedServers)
+    if (-not $servers) { throw 'Select at least one server on tab 1.' }
+    Update-Inventory
+    $thumb = $script:State.AuthThumb
+    $have = @($script:State.Inventory | Where-Object { $thumb -and $_.Thumbprint -eq $thumb })
+    $missing = @($servers | Where-Object { $_ -notin @($have | ForEach-Object { $_.Server }) })
+    $days = if ($have) { ($have | Measure-Object DaysLeft -Minimum).Minimum } else { -1 }
+
+    if ($have -and $days -ge 60) {
+        if (-not $missing) { Write-Log "The Auth certificate is on all selected servers and valid for $days more days - nothing to do (it is renewed when fewer than 60 days are left)." OK; return }
+        $msg = "Copy the Auth (OAuth) certificate $thumb to: $($missing -join ', ')?`n`nIt is exported from a server that has it (its private key must be exportable, which is the default for the Auth certificate)."
+        if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+        if (-not (Confirm-Action $msg 'Copy Auth certificate')) { Write-Log 'Cancelled.' WARN; return }
+        Copy-InstalledCertificate -Servers $servers -Thumbprint $thumb -Exportable $true
+        return
+    }
+
+    $src = $servers[0]
+    $notSelected = @($script:State.Servers.Keys | Where-Object { $_ -notin $servers })
+    $hybrid = [bool](Get-HybridConfigSafe)
+    $msg = "Create a new Auth (OAuth) certificate and make it the current one:`n`n" +
+    "1. New-ExchangeCertificate on $src (self-signed, exportable key)`n" +
+    "2. Copy it to: $($servers -join ', ')`n" +
+    "3. Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate <now>, then -PublishCertificate and -ClearPreviousCertificate`n" +
+    "4. Restart MSExchangeServiceHost and recycle the OWA and ECP app pools on each server`n`n" +
+    "Current Auth certificate: $(if ($thumb) { "$thumb ($days days left)" } else { 'none' })"
+    if ($notSelected) { $msg += "`n`nWARNING: not selected on tab 1: $($notSelected -join ', '). Every Exchange server needs the Auth certificate - select them all first." }
+    if ($hybrid) { $msg += "`n`nHybrid: rerun the Hybrid Configuration Wizard afterwards, so Exchange Online trusts the new certificate." }
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+    if (-not (Confirm-Action $msg 'Renew Auth certificate')) { Write-Log 'Cancelled.' WARN; return }
+
+    $new = Invoke-Step "New-ExchangeCertificate -Server $src -KeySize 2048 -PrivateKeyExportable `$true -SubjectName 'cn=Microsoft Exchange Server Auth Certificate' -FriendlyName 'Microsoft Exchange Server Auth Certificate' -DomainName @() -Services None" {
+        New-ExchangeCertificate -Server $src -KeySize 2048 -PrivateKeyExportable $true -SubjectName 'cn=Microsoft Exchange Server Auth Certificate' `
+            -FriendlyName 'Microsoft Exchange Server Auth Certificate' -DomainName @() -Services None -ErrorAction Stop
+    }
+    if (Test-DryRun) {
+        Write-Log "[DRY RUN] copy the new certificate to $($servers -join ', ') (Export-ExchangeCertificate / Import-ExchangeCertificate)" CMD
+        Write-Log '[DRY RUN] Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate (Get-Date) -Force; Set-AuthConfig -PublishCertificate; Set-AuthConfig -ClearPreviousCertificate' CMD
+        Write-Log '[DRY RUN] restart MSExchangeServiceHost and recycle MSExchangeOWAAppPool / MSExchangeECPAppPool on each server' CMD
+        return
+    }
+    $newThumb = "$(@($new | Where-Object { $_.Thumbprint })[0].Thumbprint)"
+    if (-not $newThumb) { throw 'New-ExchangeCertificate returned no thumbprint.' }
+    Write-Log "New Auth certificate $newThumb created on $src." OK
+    Copy-InstalledCertificate -Servers $servers -Thumbprint $newThumb -Exportable $true
+    $missingNew = @($servers | Where-Object { -not (Get-ExchangeCertSafe -Server $_ -Thumbprint $newThumb) })
+    if ($missingNew) { throw "The new Auth certificate $newThumb is not on $($missingNew -join ', ') - Set-AuthConfig was NOT changed. Fix the copy (see the log), then use the button again." }
+
+    if ($thumb) { Write-Log "Rollback (the old certificate stays installed): Set-AuthConfig -NewCertificateThumbprint $thumb -NewCertificateEffectiveDate (Get-Date) -Force; Set-AuthConfig -PublishCertificate" }
+    $force = @{}
+    if ((Get-Command Set-AuthConfig).Parameters.ContainsKey('Force')) { $force.Force = $true }
+    Invoke-Step "Set-AuthConfig -NewCertificateThumbprint $newThumb -NewCertificateEffectiveDate (Get-Date) -Force" {
+        Set-AuthConfig -NewCertificateThumbprint $newThumb -NewCertificateEffectiveDate (Get-Date) -Confirm:$false @force -ErrorAction Stop
+    }
+    Invoke-Step 'Set-AuthConfig -PublishCertificate' { Set-AuthConfig -PublishCertificate -Confirm:$false -ErrorAction Stop }
+    Invoke-Step 'Set-AuthConfig -ClearPreviousCertificate' { Set-AuthConfig -ClearPreviousCertificate -Confirm:$false -ErrorAction Stop }
+    $now = "$((Get-AuthConfig).CurrentCertificateThumbprint)"
+    if ($now -eq $newThumb) { Write-Log "The Auth certificate is now $newThumb." OK } else { Write-Log "Get-AuthConfig shows $now, expected $newThumb - check it manually." ERROR }
+
+    foreach ($s in $servers) {
+        $fqdn = Get-ServerFqdn $s
+        try {
+            Invoke-Step "Invoke-Command -ComputerName $fqdn { Restart-Service MSExchangeServiceHost; recycle MSExchangeOWAAppPool, MSExchangeECPAppPool }" {
+                Invoke-Command -ComputerName $fqdn -ErrorAction Stop -ScriptBlock {
+                    Restart-Service -Name MSExchangeServiceHost -Force -ErrorAction Stop
+                    Import-Module WebAdministration -ErrorAction Stop
+                    foreach ($pool in 'MSExchangeOWAAppPool', 'MSExchangeECPAppPool') { try { Restart-WebAppPool -Name $pool -ErrorAction Stop } catch { Start-WebAppPool -Name $pool -ErrorAction Stop } }
+                }
+                Write-Log "${s}: MSExchangeServiceHost restarted, OWA/ECP app pools recycled." OK
+            }
+        }
+        catch { Write-Log "${s}: restart failed ($($_.Exception.Message)). On the server run: Restart-Service MSExchangeServiceHost; Restart-WebAppPool MSExchangeOWAAppPool; Restart-WebAppPool MSExchangeECPAppPool" WARN }
+    }
+    Update-Inventory
+    if ($hybrid) { Write-Log 'Hybrid: rerun the Hybrid Configuration Wizard now, so Exchange Online gets the new Auth certificate (OAuth free/busy, eDiscovery and mailbox moves depend on it).' WARN }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Certificate request (CSR) for a commercial or internal CA - tab 2
+# ---------------------------------------------------------------------------------------------
+function New-CertificateRequest {
+    Assert-Exchange
+    $servers = @(Get-SelectedServers)
+    if (-not $servers) { throw 'Select at least one server on tab 1.' }
+    $src = $servers[0]
+    $names = @(Get-LeNames -AllowInternal)
+    $subject = "CN=$($names[0])"
+    $friendly = 'Exchange {0} {1:yyyy-MM-dd}' -f $names[0], (Get-Date)
+    $cmd = "New-ExchangeCertificate -Server $src -GenerateRequest -SubjectName '$subject' -DomainName $($names -join ',') -KeySize 2048 -PrivateKeyExportable `$true -FriendlyName '$friendly'"
+    $msg = "Create a certificate request (CSR) on $src for:`n  $($names -join "`n  ")`n`nThe private key is created on $src and marked exportable, so Step A can copy the issued certificate to the other servers. The names come from the list on tab 1b."
+    if (Test-DryRun) { Write-Log "[DRY RUN] $cmd" CMD; Write-Log '[DRY RUN] the request would be saved to a .req file you choose.' CMD; return }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Filter = 'Certificate request (*.req)|*.req|All files (*.*)|*.*'
+    $dlg.FileName = ($names[0] -replace '^\*\.', 'wildcard.') + '.req'
+    if (-not $dlg.ShowDialog($script:Window)) { return }
+    if (-not (Confirm-Action $msg 'Create CSR')) { Write-Log 'Cancelled.' WARN; return }
+    $req = Invoke-Step $cmd {
+        New-ExchangeCertificate -Server $src -GenerateRequest -SubjectName $subject -DomainName $names -KeySize 2048 -PrivateKeyExportable $true -FriendlyName $friendly -ErrorAction Stop
+    }
+    $req = (@($req | Where-Object { $_ }) | ForEach-Object { "$_" }) -join "`r`n"
+    if (-not $req) { throw 'New-ExchangeCertificate returned no request text.' }
+    [IO.File]::WriteAllText($dlg.FileName, $req, [Text.Encoding]::ASCII)
+    Write-Log "CSR saved to $($dlg.FileName). Submit it to your CA (DigiCert, Sectigo, GlobalSign ...). Internal AD CS: certreq -submit -attrib ""CertificateTemplate:WebServer"" ""$($dlg.FileName)"" ""$([IO.Path]::ChangeExtension($dlg.FileName, '.cer'))"". Then click ""Complete pending request""." OK
+}
+
+# Imports the issued certificate on the server that holds the matching pending request, then uses it as the new certificate.
+function Complete-CertificateRequest {
+    Assert-Exchange
+    $servers = @(Get-SelectedServers)
+    if (-not $servers) { throw 'Select at least one server on tab 1.' }
+    $dlg = New-Object Microsoft.Win32.OpenFileDialog
+    $dlg.Filter = 'Issued certificate (*.cer;*.crt;*.p7b;*.pem)|*.cer;*.crt;*.p7b;*.pem|All files (*.*)|*.*'
+    if (-not $dlg.ShowDialog($script:Window)) { return }
+    $bytes = [IO.File]::ReadAllBytes($dlg.FileName)
+    $type = [System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($bytes)
+    # Opening a PFX here could store its private key on this machine - PFX files go through Browse instead.
+    if ("$type" -in 'Pfx', 'Pkcs12') { throw 'This is a PFX file (with private key). Use "Browse..." for PFX files.' }
+    $coll = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+    $coll.Import($bytes)
+    $leaf = @($coll | Where-Object { $c = $_; -not ($coll | Where-Object { $_.Thumbprint -ne $c.Thumbprint -and $_.Issuer -eq $c.Subject }) }) | Select-Object -First 1
+    if (-not $leaf) { throw 'No certificate found in the file.' }
+    $cn = $leaf.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    Write-Log "Issued certificate: $($leaf.Subject), issuer $($leaf.Issuer), thumbprint $($leaf.Thumbprint), expires $($leaf.NotAfter.ToString('yyyy-MM-dd'))."
+    $pending = @(foreach ($s in $servers) {
+            foreach ($p in @(Get-ExchangeCertificate -Server $s | Where-Object { "$($_.Status)" -eq 'PendingRequest' })) {
+                $pcn = if ("$($p.Subject)" -match '(?:^|,\s*)CN=([^,]+)') { $Matches[1].Trim() } else { '' }
+                if ($pcn -eq $cn) { [pscustomobject]@{ Server = $s; Thumbprint = "$($p.Thumbprint)" } }
+            }
+        })
+    if (-not $pending) { throw "No pending request for CN=$cn was found on $($servers -join ', '). Select the server where you created the CSR on tab 1." }
+    $msg = "Import $($dlg.FileName)`n  $($leaf.Subject)`n`ninto the pending request on: $(($pending | ForEach-Object { $_.Server } | Select-Object -Unique) -join ', ')"
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+    if (-not (Confirm-Action $msg 'Complete pending request')) { Write-Log 'Cancelled.' WARN; return }
+    $done = $null
+    foreach ($s in @($pending | ForEach-Object { $_.Server } | Select-Object -Unique)) {
+        try {
+            Invoke-Step "Import-ExchangeCertificate -Server $s -FileData <$($bytes.Length) bytes of $($dlg.FileName)>" {
+                Import-ExchangeCertificate -Server $s -FileData $bytes -ErrorAction Stop | Out-Null
+            }
+            if (Test-DryRun) { continue }
+            $ex = Get-ExchangeCertSafe -Server $s -Thumbprint $leaf.Thumbprint
+            if ($ex -and "$($ex.HasPrivateKey)" -ne 'False') { $done = $s; Write-Log "${s}: request completed - certificate $($leaf.Thumbprint) installed with its private key." OK; break }
+            Write-Log "${s}: the certificate was imported but has no private key here - the CSR was created on another server." ERROR
+        }
+        catch { Write-Log "${s}: import FAILED: $($_.Exception.Message)" WARN }
+    }
+    if (Test-DryRun) { return }
+    if (-not $done) { throw 'The certificate could not be paired with a pending request (see the log).' }
+    Write-Log 'If the CA sent an intermediate certificate, it must be in the Intermediate Certification Authorities store of every server (the chain check in tab 2 shows it).'
+    Update-InventoryAndInstalled
+    $idx = -1
+    for ($k = 0; $k -lt @($script:InstalledChoices).Count; $k++) { if ($script:InstalledChoices[$k].Thumbprint -eq $leaf.Thumbprint) { $idx = $k } }
+    if ($idx -lt 0) { throw "Certificate $($leaf.Thumbprint) is installed on $done but not in the installed list - pick it under ""Or installed""." }
+    $script:ui.InstalledCertCombo.SelectedIndex = $idx
+    Invoke-UseInstalledCertificate
+}
+
+# ---------------------------------------------------------------------------------------------
+# Rolling restart - tab 4
+# ---------------------------------------------------------------------------------------------
+function Invoke-RollingRestart {
+    Assert-Exchange
+    $servers = @(Get-SelectedServers)
+    if (-not $servers) { throw 'Select at least one server on tab 1.' }
+    # iisreset on the server that hosts this tool's Exchange session drops the session for a moment: do it last.
+    $servers = @($servers | Where-Object { $_ -ne $env:COMPUTERNAME }) + @($servers | Where-Object { $_ -eq $env:COMPUTERNAME })
+    $msg = "Restart IIS (iisreset /noforce) and the Microsoft Exchange Frontend Transport service, one server at a time:`n  $($servers -join "`n  ")`n`n" +
+    'After each server the tool waits until HTTPS (443) answers again before the next one, and stops if a server does not come back. Clients on that server are disconnected for a moment.'
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+    if (-not (Confirm-Action $msg 'Rolling restart')) { Write-Log 'Cancelled.' WARN; return }
+    foreach ($s in $servers) {
+        $fqdn = Get-ServerFqdn $s
+        Invoke-Step "Invoke-Command -ComputerName $fqdn { iisreset /noforce }" {
+            Invoke-Command -ComputerName $fqdn -ErrorAction Stop -ScriptBlock { $o = & iisreset.exe /noforce 2>&1 | Out-String; if ($LASTEXITCODE) { throw "iisreset exit code ${LASTEXITCODE}: $o" } }
+        }
+        Invoke-Step "Restart-Service MSExchangeFrontEndTransport on $fqdn" {
+            Get-Service -ComputerName $fqdn -Name MSExchangeFrontEndTransport -ErrorAction Stop | Restart-Service -Force -ErrorAction Stop
+        }
+        if (Test-DryRun) { continue }
+        $deadline = (Get-Date).AddMinutes(3); $served = $null
+        while (-not $served) {
+            try { $served = Get-RemoteTlsCertificate -HostName $fqdn -Port 443 -TimeoutMs 5000 } catch { }
+            if ($served) { break }
+            if ((Get-Date) -gt $deadline) { throw "$s does not answer on port 443 three minutes after the restart - stopped; the remaining servers were not restarted." }
+            Wait-Ui 5
+        }
+        $isNew = $script:State.NewThumb -and $served.Thumbprint -eq $script:State.NewThumb
+        Write-Log ('{0}: back online, port 443 serves {1}{2}.' -f $s, $served.Thumbprint, $(if ($isNew) { ' (the new certificate)' } elseif ($script:State.NewThumb) { ' - NOT the new certificate' } else { '' })) $(if ($script:State.NewThumb -and -not $isNew) { 'WARN' } else { 'OK' })
+    }
+    Write-Log 'Rolling restart finished. Run the verification again.' OK
+}
+
+# ---------------------------------------------------------------------------------------------
+# Rollback snapshots - tab 3 (saved before Step B and Step C)
+# ---------------------------------------------------------------------------------------------
+function Save-ChangeSnapshot {
+    param([string]$Before)
+    $servers = @(Get-SelectedServers)
+    Update-Inventory
+    $x509Name = { param($cmd, $s) try { "$((& $cmd -Server $s -ErrorAction Stop).X509CertificateName)" } catch { '' } }
+    $srv = [ordered]@{}
+    foreach ($s in $servers) {
+        $srv[$s] = [ordered]@{
+            Iis               = @($script:State.Inventory | Where-Object { $_.Server -eq $s -and $_.SelfSigned -ne 'True' -and ($_.Services -split ',') -contains 'IIS' } | ForEach-Object { $_.Thumbprint })
+            InternalTransport = "$($script:State.Servers[$s].InternalTransportThumb)"
+            Pop               = & $x509Name 'Get-PopSettings' $s
+            Imap              = & $x509Name 'Get-ImapSettings' $s
+        }
+    }
+    $conns = New-Object System.Collections.Generic.List[object]
+    try { foreach ($c in @(Get-SendConnector)) { $conns.Add([ordered]@{ Type = 'Send'; Identity = "$($c.Identity)"; Tls = "$($c.TlsCertificateName)" }) } }
+    catch { Write-Log "Get-SendConnector failed: $($_.Exception.Message)" WARN }
+    foreach ($s in $servers) {
+        try { foreach ($c in @(Get-ReceiveConnector -Server $s)) { $conns.Add([ordered]@{ Type = 'Receive'; Identity = "$($c.Identity)"; Tls = "$($c.TlsCertificateName)" }) } }
+        catch { Write-Log "${s}: Get-ReceiveConnector failed: $($_.Exception.Message)" WARN }
+    }
+    $hc = Get-HybridConfigSafe
+    $snap = [ordered]@{
+        Created = (Get-Date).ToString('s'); Before = $Before; NewThumbprint = $script:State.NewThumb
+        Servers = $srv; Connectors = $conns.ToArray(); Hybrid = $(if ($hc) { "$($hc.TlsCertificateName)" } else { $null })
+    }
+    $path = Join-Path (Split-Path $script:LogFile) ('Snapshot_{0:yyyyMMdd_HHmmss}_before-{1}.json' -f (Get-Date), $Before)
+    $snap | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
+    Write-Log "Saved the current configuration to $path (tab 3, ""Roll back from snapshot"", restores it)." OK
+}
+
+# What has to change to get back to the snapshot. One row per command; Kind selects the cmdlet.
+function Get-RollbackPlan {
+    param([Parameter(Mandatory)]$Snapshot)
+    $plan = New-Object System.Collections.Generic.List[object]
+    $q = { param([string]$s) if ($s) { "'" + ($s -replace "'", "''") + "'" } else { '$null' } }
+    $add = { param($Kind, $Server, $Identity, $Value, $Text) $plan.Add([pscustomobject]@{ Kind = $Kind; Server = $Server; Identity = $Identity; Value = $Value; Text = $Text }) }
+    foreach ($p in @($Snapshot.Servers.PSObject.Properties)) {
+        $s = $p.Name; $v = $p.Value
+        $want = @(@($v.Iis) | Where-Object { $_ })[0]
+        if ($want) {
+            $certs = @(Get-ExchangeCertificate -Server $s)
+            $cur = @($certs | Where-Object { "$($_.IsSelfSigned)" -ne 'True' -and (Get-ServiceList $_) -contains 'IIS' } | ForEach-Object { "$($_.Thumbprint)" })
+            if ($cur -notcontains $want) {
+                if ($certs | Where-Object { "$($_.Thumbprint)" -eq $want }) { & $add 'IIS' $s $null $want "Enable-ExchangeCertificate -Server $s -Thumbprint $want -Services IIS -Force" }
+                else { Write-Log "${s}: the snapshot's IIS certificate $want is no longer installed (removed on tab 5?) - IIS cannot be rolled back on this server." ERROR }
+            }
+        }
+        if ("$($v.InternalTransport)") {
+            $cur = "$((Get-TransportService -Identity $s).InternalTransportCertificateThumbprint)"
+            if ($cur -ne "$($v.InternalTransport)") { & $add 'Transport' $s $null "$($v.InternalTransport)" "Set-TransportService -Identity $s -InternalTransportCertificateThumbprint $($v.InternalTransport)" }
+        }
+        foreach ($kind in 'Pop', 'Imap') {
+            $want = "$($v.$kind)"
+            if (-not $want) { continue }
+            $cur = "$((& "Get-${kind}Settings" -Server $s).X509CertificateName)"
+            if ($cur -ne $want) { & $add $kind $s $null $want "Set-${kind}Settings -Server $s -X509CertificateName $want" }
+        }
+    }
+    foreach ($c in @($Snapshot.Connectors)) {
+        $get = if ($c.Type -eq 'Send') { 'Get-SendConnector' } else { 'Get-ReceiveConnector' }
+        try { $cur = "$((& $get -Identity $c.Identity -ErrorAction Stop).TlsCertificateName)" }
+        catch { Write-Log "Connector '$($c.Identity)' not found - skipped." WARN; continue }
+        if ($cur -ne "$($c.Tls)") {
+            $val = if ("$($c.Tls)") { "$($c.Tls)" } else { $null }
+            & $add $c.Type $null $c.Identity $val "Set-$($c.Type)Connector -Identity $(& $q $c.Identity) -TlsCertificateName $(& $q $val)"
+        }
+    }
+    if ($null -ne $Snapshot.Hybrid) {
+        $hc = Get-HybridConfigSafe
+        if ($hc -and "$($hc.TlsCertificateName)" -ne "$($Snapshot.Hybrid)") {
+            $val = if ("$($Snapshot.Hybrid)") { "$($Snapshot.Hybrid)" } else { $null }
+            & $add 'Hybrid' $null $null $val "Set-HybridConfiguration -TlsCertificateName $(& $q $val)"
+        }
+    }
+    $plan.ToArray()
+}
+
+function Invoke-Rollback {
+    param([string]$Path)
+    Assert-Exchange
+    if (-not $Path) {
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.InitialDirectory = Split-Path $script:LogFile
+        $dlg.Filter = 'Snapshot (Snapshot_*.json)|Snapshot_*.json|All files (*.*)|*.*'
+        if (-not $dlg.ShowDialog($script:Window)) { return }
+        $Path = $dlg.FileName
+    }
+    $snap = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    Write-Log "Rollback: comparing the current configuration with $Path (saved $($snap.Created), before $($snap.Before))."
+    $plan = @(Get-RollbackPlan -Snapshot $snap)
+    if (-not $plan) { Write-Log 'Nothing to roll back - the configuration matches the snapshot.' OK; return }
+    $msg = "Restore this configuration from the snapshot?`n`n$(($plan | ForEach-Object { '  ' + $_.Text }) -join "`n")`n`nThe new certificate stays installed (and enabled for SMTP); only the settings above change."
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+    if (-not (Confirm-Action $msg 'Roll back')) { Write-Log 'Rollback cancelled.' WARN; return }
+    foreach ($r in $plan) {
+        try {
+            Invoke-Step $r.Text {
+                switch ($r.Kind) {
+                    'IIS' { Enable-ExchangeCertificate -Server $r.Server -Thumbprint $r.Value -Services IIS -Force -ErrorAction Stop }
+                    'Transport' { Set-TransportService -Identity $r.Server -InternalTransportCertificateThumbprint $r.Value -ErrorAction Stop }
+                    'Pop' { Set-PopSettings -Server $r.Server -X509CertificateName $r.Value -ErrorAction Stop }
+                    'Imap' { Set-ImapSettings -Server $r.Server -X509CertificateName $r.Value -ErrorAction Stop }
+                    'Send' { Set-SendConnector -Identity $r.Identity -TlsCertificateName $r.Value -ErrorAction Stop }
+                    'Receive' { Set-ReceiveConnector -Identity $r.Identity -TlsCertificateName $r.Value -ErrorAction Stop }
+                    'Hybrid' { Set-HybridConfiguration -TlsCertificateName $r.Value -ErrorAction Stop }
+                }
+                Write-Log "Restored: $($r.Text)" OK
+            }
+        }
+        catch { Write-Log "Rollback step failed: $($r.Text): $($_.Exception.Message)" ERROR }
+    }
+    if (-not (Test-DryRun)) { Update-Inventory; Write-Log 'Rollback done. Wait a few minutes for transport, restart services if needed (tab 4, Rolling restart), then verify.' OK }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Edge Transport package - tab 3 (Edge servers are not in AD, so the tool cannot reach them)
+# ---------------------------------------------------------------------------------------------
+$script:EdgeScriptTemplate = @'
+<#
+    Generated by ExchangeCertTool on __DATE__ for certificate __THUMB__
+    (__SUBJECT__).
+
+    Run on each Edge Transport server in an elevated Exchange Management Shell:
+        .\Install-EdgeCertificate.ps1 -WhatIf                   # show what would happen
+        .\Install-EdgeCertificate.ps1                           # import and enable for SMTP
+        .\Install-EdgeCertificate.ps1 -UpdatePinnedConnectors   # also switch receive connectors that pin another certificate
+
+    The internal transport (default SMTP) certificate is kept, so the Edge Subscription stays valid.
+    Delete this folder when you are done: certificate.pfx contains the private key.
+#>
+param([switch]$WhatIf, [switch]$UpdatePinnedConnectors)
+$ErrorActionPreference = 'Stop'
+$thumb = '__THUMB__'
+$tls = '__TLSNAME__'
+$pfx = Join-Path $PSScriptRoot 'certificate.pfx'
+$server = $env:COMPUTERNAME
+function Invoke-EdgeStep([string]$Text, [scriptblock]$Action) {
+    if ($WhatIf) { Write-Host "[WhatIf] $Text" -ForegroundColor Cyan } else { Write-Host $Text -ForegroundColor Cyan; & $Action }
+}
+
+$before = "$((Get-TransportService -Identity $server).InternalTransportCertificateThumbprint)"
+Write-Host "Internal transport certificate (used by the Edge Subscription): $before"
+if (Get-ExchangeCertificate -Thumbprint $thumb -ErrorAction SilentlyContinue) { Write-Host "Certificate $thumb is already imported." -ForegroundColor Green }
+else {
+    $pw = Read-Host 'PFX password' -AsSecureString
+    Invoke-EdgeStep 'Import-ExchangeCertificate -FileData <certificate.pfx> -Password <hidden>' { Import-ExchangeCertificate -FileData ([IO.File]::ReadAllBytes($pfx)) -Password $pw | Out-Null }
+}
+Invoke-EdgeStep "Enable-ExchangeCertificate -Thumbprint $thumb -Services SMTP -Force" { Enable-ExchangeCertificate -Thumbprint $thumb -Services SMTP -Force }
+if (-not $WhatIf) {
+    $after = "$((Get-TransportService -Identity $server).InternalTransportCertificateThumbprint)"
+    if ($before -and $after -ne $before) {
+        Invoke-EdgeStep "Set-TransportService -Identity $server -InternalTransportCertificateThumbprint $before   # restore" {
+            Set-TransportService -Identity $server -InternalTransportCertificateThumbprint $before
+        }
+    }
+}
+foreach ($c in @(Get-ReceiveConnector -Server $server)) {
+    $cur = "$($c.TlsCertificateName)"
+    if (-not $cur -or $cur -eq $tls) { continue }
+    if ($UpdatePinnedConnectors) {
+        Write-Host "Rollback: Set-ReceiveConnector -Identity '$($c.Identity)' -TlsCertificateName '$cur'"
+        Invoke-EdgeStep "Set-ReceiveConnector -Identity '$($c.Identity)' -TlsCertificateName '$tls'" { Set-ReceiveConnector -Identity $c.Identity -TlsCertificateName $tls }
+    }
+    else { Write-Host "Connector '$($c.Identity)' pins $cur - run again with -UpdatePinnedConnectors to switch it to the new certificate." -ForegroundColor Yellow }
+}
+Write-Host 'Done. If port 25 still offers the old certificate, restart MSExchangeTransport in a quiet period. Then delete this folder.' -ForegroundColor Green
+'@
+
+function New-EdgePackage {
+    Assert-Validated
+    if (-not $script:State.PfxPath) { throw 'The Edge package needs the PFX file: Edge servers are not in Active Directory, so the certificate cannot be copied from Exchange. Load the PFX on tab 2.' }
+    $dir = Join-Path (Split-Path $script:LogFile) ('EdgePackage_{0:yyyyMMdd_HHmmss}' -f (Get-Date))
+    $msg = "Create a folder with a copy of the PFX and an install script for Edge Transport servers?`n`n  $dir`n`n" +
+    'The PFX password is not stored - the script asks for it. Copy the folder to each Edge server, run Install-EdgeCertificate.ps1 in the Exchange Management Shell, then delete the folder.'
+    if (-not (Confirm-Action $msg 'Edge Transport package')) { Write-Log 'Cancelled.' WARN; return }
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Copy-Item -LiteralPath $script:State.PfxPath -Destination (Join-Path $dir 'certificate.pfx')
+    $new = $script:State.NewCert
+    $tls = "<I>$($new.Issuer)<S>$($new.Subject)"
+    $text = $script:EdgeScriptTemplate.Replace('__DATE__', (Get-Date).ToString('yyyy-MM-dd HH:mm')).Replace('__THUMB__', $script:State.NewThumb)
+    $text = $text.Replace('__SUBJECT__', ($new.Subject -replace '#>', '')).Replace('__TLSNAME__', ($tls -replace "'", "''"))
+    [IO.File]::WriteAllText((Join-Path $dir 'Install-EdgeCertificate.ps1'), $text, (New-Object System.Text.UTF8Encoding($true)))
+    Write-Log "Edge Transport package created: $dir (certificate.pfx + Install-EdgeCertificate.ps1). It contains the private key - delete it after use." OK
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1445,12 +2159,13 @@ function Get-LeMode {
 }
 
 function Get-LeNames {
+    param([switch]$AllowInternal)   # CSR for an internal CA
     $names = @($script:ui.LeNamesBox.Text -split '[\r\n,;\s]+' |
         ForEach-Object { $_.Trim().TrimEnd('.').ToLowerInvariant() } | Where-Object { $_ } | Select-Object -Unique)
     if (-not $names) { throw 'Enter at least one name for the certificate.' }
     foreach ($n in $names) {
         if ($n -notmatch '^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$') { throw "Not a valid DNS name: $n" }
-        if ($n -match '\.(local|lan|internal|corp|intra|localdomain|home|private)$') { throw "Public CAs cannot issue certificates for internal names: $n" }
+        if (-not $AllowInternal -and $n -match '\.(local|lan|internal|corp|intra|localdomain|home|private)$') { throw "Public CAs cannot issue certificates for internal names: $n" }
     }
     if ($names.Count -gt 100) { throw "ACME certificates allow at most 100 names (you have $($names.Count))." }
     $names
@@ -1851,6 +2566,7 @@ function Start-LeRequest {
     $script:Le.Provider = $provider
     if ($plugin -eq 'Cloudflare') { Save-CfToken }
     $script:Le.Mode = $mode; $script:Le.Plugin = $plugin; $script:Le.PluginArgs = $pluginArgs; $script:Le.Names = $names
+    $script:Le.UiMode = Get-LeMode   # 'Cloudflare' is kept apart from other plugins for the renewal settings
     $challenges = New-Object System.Collections.Generic.List[object]
     try {
         foreach ($a in @($order | Get-PAAuthorization)) {
@@ -2006,6 +2722,9 @@ function Complete-LeRequest {
         Write-Log "PFX: $($cert.PfxFullChain) (password kept by Posh-ACME: (Get-PAOrder '$($order.Name)').PfxPass)"
     }
     finally { if (-not $keepChallenges) { Clear-LeChallenges } }
+    if (-not $script:Le.Provider.Staging) {
+        try { Save-RenewalProfile } catch { Write-Log "Could not save the renewal settings: $($_.Exception.Message)" WARN }
+    }
 
     $script:ui.PfxPathBox.Text = $cert.PfxFullChain
     $script:ui.PfxPasswordBox.Password = (New-Object System.Net.NetworkCredential('', $cert.PfxPass)).Password
@@ -2052,6 +2771,192 @@ function Show-LePluginParams {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Unattended renewal (-Renew) for a scheduled task
+# ---------------------------------------------------------------------------------------------
+$script:RenewalProfileFile = Join-Path $env:LOCALAPPDATA 'ExchangeCertTool\renewal.json'
+
+# Saved after every certificate issued by a production CA: what -Renew needs to request the next one.
+# Secrets are not in it: the Cloudflare token has its own DPAPI file; plugin arguments are DPAPI-encrypted here.
+function Save-RenewalProfile {
+    $mode = $script:Le.UiMode
+    if ($mode -eq 'DNSManual') { Write-Log 'Automatic renewal (-Renew) cannot use DNS-01 manual. Use HTTP-01, Cloudflare or a DNS plugin to make renewals automatic.' INFO; return }
+    if ($mode -eq 'Cloudflare' -and -not $script:ui.LeCfRememberCheck.IsChecked) { Write-Log 'For automatic renewal (-Renew), tick "Remember the token" on tab 1b and test the token once.' WARN }
+    $argsText = $script:ui.LePluginArgsBox.Text.Trim()
+    $p = [ordered]@{
+        Version    = 1
+        Saved      = (Get-Date).ToString('s')
+        User       = "$env:USERDOMAIN\$env:USERNAME"
+        Provider   = $script:Le.Provider.Server
+        Names      = @($script:Le.Names)
+        Mode       = $mode
+        Plugin     = "$($script:Le.Plugin)"
+        PluginArgs = $(if ($mode -eq 'DNSPlugin' -and $argsText) { ConvertTo-SecureString $argsText -AsPlainText -Force | ConvertFrom-SecureString } else { '' })
+        Webroot    = $script:ui.LeWebrootBox.Text.Trim()
+        KeyLength  = "$($script:ui.LeKeyCombo.SelectedItem.Content)"
+        Email      = $script:ui.LeEmailBox.Text.Trim()
+        Servers    = @(Get-SelectedServers)
+    }
+    $dir = Split-Path $script:RenewalProfileFile
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $p | ConvertTo-Json | Set-Content -LiteralPath $script:RenewalProfileFile -Encoding UTF8
+    Write-Log "Renewal settings saved for -Renew: $script:RenewalProfileFile ($($p.Provider), $mode, $($p.Names.Count) name(s), servers $($p.Servers -join ', '))."
+}
+
+function Get-RenewalProfile {
+    if (-not (Test-Path -LiteralPath $script:RenewalProfileFile)) {
+        throw "No renewal settings found ($script:RenewalProfileFile). Request a certificate once in the GUI as $env:USERDOMAIN\$env:USERNAME from a production CA with HTTP-01, Cloudflare or a DNS plugin - the settings are saved when it is issued."
+    }
+    Get-Content -LiteralPath $script:RenewalProfileFile -Raw | ConvertFrom-Json
+}
+
+# Puts the saved settings into the (hidden) window, so Start-LeRequest runs exactly as from the GUI.
+function Set-RenewalUi {
+    param([Parameter(Mandatory)]$Settings)
+    $ui = $script:ui
+    $idx = -1
+    for ($k = 0; $k -lt $script:AcmeProviders.Count; $k++) { if ($script:AcmeProviders[$k].Server -eq "$($Settings.Provider)") { $idx = $k } }
+    if ($idx -lt 0 -or $script:AcmeProviders[$idx].Staging) { throw "The saved certificate authority '$($Settings.Provider)' is not a production CA of this tool." }
+    $ui.LeProviderCombo.SelectedIndex = $idx
+    $ui.LeTosCheck.IsChecked = $true   # accepted when the account was created in the GUI
+    $ui.LeEmailBox.Text = "$($Settings.Email)"
+    $ui.LeNamesBox.Text = (@($Settings.Names) -join "`r`n")
+    foreach ($it in $ui.LeKeyCombo.Items) { if ("$($it.Content)" -eq "$($Settings.KeyLength)") { $ui.LeKeyCombo.SelectedItem = $it } }
+    switch ("$($Settings.Mode)") {
+        'HTTP' { $ui.LeHttpRadio.IsChecked = $true; if ("$($Settings.Webroot)") { $ui.LeWebrootBox.Text = "$($Settings.Webroot)" } }
+        'Cloudflare' {
+            if (-not $ui.LeCfTokenBox.Password) { throw 'No saved Cloudflare token for this user. In the GUI, paste the token, tick "Remember the token" and click "Test Cloudflare token".' }
+            $ui.LeCfRadio.IsChecked = $true
+        }
+        'DNSPlugin' {
+            $ui.LeDnsPluginRadio.IsChecked = $true
+            $ui.LePluginCombo.Text = "$($Settings.Plugin)"
+            if ("$($Settings.PluginArgs)") { $ui.LePluginArgsBox.Text = (New-Object System.Net.NetworkCredential('', (ConvertTo-SecureString "$($Settings.PluginArgs)"))).Password }
+        }
+        default { throw "Challenge type '$($Settings.Mode)' cannot run unattended." }
+    }
+}
+
+# Reasons not to touch Exchange with the validated certificate during an unattended run.
+function Get-RenewalBlockers {
+    param([object[]]$OldIis)
+    $oldNames = @($OldIis | ForEach-Object { $_.Domains; if ("$($_.Subject)" -match '(?:^|,\s*)CN=([^,]+)') { $Matches[1].Trim() } } | Where-Object { $_ } | ForEach-Object { "$_".ToLowerInvariant() })
+    $lost = @($script:State.MissingHosts | Where-Object { $oldNames.Count -and (Test-HostCovered -HostName $_ -CertNames $oldNames) })
+    if ($lost) { "the new certificate does not cover $($lost -join ', '), which the current certificate covers" }
+    @($script:State.BlockingIssues)
+}
+
+function Send-RenewalReport {
+    param([string]$Result)
+    if (-not $NotifyTo) { return }
+    $from = $NotifyFrom
+    if (-not $from) {
+        try { $d = "$((Get-AcceptedDomain | Where-Object { $_.Default } | Select-Object -First 1).DomainName)"; if ($d) { $from = "ExchangeCertTool@$d" } } catch { }
+    }
+    if (-not $from) { $from = "ExchangeCertTool@$env:USERDNSDOMAIN" }
+    try {
+        Send-MailMessage -SmtpServer $SmtpServer -From $from -To $NotifyTo -Subject "[ExchangeCertTool] Certificate renewal $Result on $env:COMPUTERNAME" `
+            -Body (Get-Content -LiteralPath $script:LogFile -Raw) -Encoding UTF8 -ErrorAction Stop
+        Write-Log "Report sent to $($NotifyTo -join ', ') via $SmtpServer." OK
+    }
+    catch { Write-Log "Could not send the report to $($NotifyTo -join ', ') via ${SmtpServer}: $($_.Exception.Message)" ERROR }
+}
+
+# Runs the GUI steps without the GUI. Sets $script:RenewExitCode: 0 = done or nothing to do, 1 = failed.
+function Invoke-UnattendedRenewal {
+    $script:Unattended = $true
+    $script:RenewExitCode = 1
+    $result = 'FAILED'
+    try {
+        Assert-Exchange
+        $settings = Get-RenewalProfile
+        New-MainWindow
+        Register-UiEvents
+        $ui = $script:ui
+        $ui.DryRunCheck.IsChecked = -not $Live
+        Write-Log ('Unattended renewal ({0}) for {1}; settings saved {2} by {3}.' -f $(if ($Live) { 'LIVE' } else { 'DRY RUN - add -Live to make changes' }), (@($settings.Names) -join ', '), $settings.Saved, $settings.User)
+
+        Update-ServerList
+        if (@($settings.Servers).Count) {
+            $ui.ServerList.SelectedItems.Clear()
+            foreach ($s in @($settings.Servers)) {
+                if ($ui.ServerList.Items -contains $s) { [void]$ui.ServerList.SelectedItems.Add($s) } else { Write-Log "Server $s from the renewal settings is no longer a mailbox server - skipped." WARN }
+            }
+            foreach ($s in @($ui.ServerList.Items | Where-Object { $_ -notin @($settings.Servers) })) { Write-Log "Mailbox server $s is not in the renewal settings - it does not get the new certificate. Renew once in the GUI with all servers selected to include it." WARN }
+        }
+        if (-not @(Get-SelectedServers).Count) { throw 'None of the servers in the renewal settings exists.' }
+        Update-Inventory
+        $oldIis = @(Get-CurrentIisCertificates)
+        if ($oldIis) {
+            $days = [int][math]::Floor((($oldIis | ForEach-Object { [datetime]$_.NotAfter } | Measure-Object -Minimum).Minimum - (Get-Date)).TotalDays)
+            Write-Log "Current IIS certificate(s): $(($oldIis | ForEach-Object { "$($_.Thumbprint) ($($_.Subject), exp $(([datetime]$_.NotAfter).ToString('yyyy-MM-dd')))" }) -join '; '). $days day(s) left."
+            if (-not $ForceRenew -and $days -ge $RenewDays) {
+                Write-Log "More than $RenewDays days left - nothing to do. (-ForceRenew renews anyway.)" OK
+                $result = 'NOTNEEDED'; $script:RenewExitCode = 0; return
+            }
+        }
+        else { Write-Log 'No CA-issued certificate is bound to IIS on the selected servers - requesting one.' WARN }
+
+        # A certificate that an earlier run issued but did not finish installing (e.g. import failed) is reused, so
+        # repeated failures do not use up the CA's rate limits (Let's Encrypt: 5 identical certificates per week).
+        # It cannot be the certificate on IIS: that one has fewer than -RenewDays left, or we would have stopped above.
+        $first = "$(@($settings.Names)[0])"
+        $reuse = @(Find-AcmeSavedCertificates | Where-Object { $_.MainDomain -eq $first -and $_.Server -notmatch 'stag|test|preprod' -and $_.Expires -and ($_.Expires - (Get-Date)).TotalDays -gt $RenewDays } |
+            Sort-Object Written -Descending | Select-Object -First 1)
+        if ($reuse) {
+            Write-Log "Reusing the certificate Posh-ACME issued on $($reuse[0].Written.ToString('yyyy-MM-dd HH:mm')) (expires $($reuse[0].Expires.ToString('yyyy-MM-dd'))): $($reuse[0].Path)" OK
+            $ui.PfxPathBox.Text = $reuse[0].Path
+            $ui.PfxPasswordBox.Password = $reuse[0].Password
+            try { $null = Invoke-ValidatePfx } catch { Write-Log "The saved certificate could not be validated: $($_.Exception.Message)" WARN }
+            if (-not $script:State.Validated) { Write-Log 'The saved certificate is not usable - requesting a new one.' WARN }
+        }
+        if (-not $script:State.Validated) {
+            Set-RenewalUi -Settings $settings
+            $null = Start-LeRequest
+            if (-not $Live) { Write-Log 'Dry run: stopped after the ACME step (nothing was requested). Steps A, B, C, Verify and removal run with -Live.' OK; $result = 'DRYRUN'; $script:RenewExitCode = 0; return }
+        }
+        if (-not $script:State.Validated) { throw 'The new certificate did not pass validation - see the log above.' }
+        $blockers = @(Get-RenewalBlockers -OldIis $oldIis)
+        if ($blockers) { throw "Stopped before changing Exchange: $($blockers -join ' | ')" }
+
+        # Keep the decisions made in the GUI: only connectors pinned to the old certificate change (Step C);
+        # POP/IMAP only if the old certificate served them.
+        $ui.PinFrontendCheck.IsChecked = $false
+        $ui.PinClientCheck.IsChecked = $false
+        $oldThumbs = @($oldIis | ForEach-Object { $_.Thumbprint })
+        $ui.PopImapCheck.IsChecked = [bool](@($script:State.Inventory | Where-Object { $_.Thumbprint -in $oldThumbs -and $_.Services -match 'POP|IMAP' }).Count)
+        foreach ($step in @(@('Step A (import)', { Invoke-ImportCertificate }), @('Step B (enable)', { Invoke-EnableCertificate }), @('Step C (connectors)', { Invoke-UpdateConnectors }))) {
+            $errorsBefore = $script:ErrorCount
+            Write-Log "--- $($step[0]) ---"
+            $null = & $step[1]
+            if ($script:ErrorCount -gt $errorsBefore) { throw "$($step[0]) reported errors - stopped. The previous configuration is in the newest logs\Snapshot_*.json (GUI tab 3: Roll back)." }
+        }
+        if (-not $Live) { Write-Log 'Dry run: Steps A, B and C were logged above. Verify and removal run with -Live.' OK; $result = 'DRYRUN'; $script:RenewExitCode = 0; return }
+        Write-Log '--- Verify ---'
+        $null = Invoke-Verify
+        $servers = @(Get-SelectedServers)
+        if (@($servers | Where-Object { -not $script:State.Verified[$_] }).Count) {
+            Write-Log 'Not every server serves the new certificate yet - checking again in 2 minutes.' WARN
+            Wait-Ui 120
+            $null = Invoke-Verify
+        }
+        $failed = @($servers | Where-Object { -not $script:State.Verified[$_] })
+        if ($failed) { throw "Verification failed on $($failed -join ', '). The new certificate is enabled; check the HTTPS binding or run iisreset /noforce (GUI tab 4: Rolling restart)." }
+
+        if ($RemoveOld) {
+            Write-Log '--- Remove old certificate ---'
+            $rows = @(Update-OldCandidates -PassThru | Where-Object { $_.Removable -eq 'yes' -and $_.Thumbprint -in $oldThumbs })
+            if ($rows) { $null = Invoke-RemoveOld -Rows $rows } else { Write-Log 'No old certificate can be removed safely (see the Blockers in the log).' WARN }
+        }
+        else { Write-Log 'The old certificate is kept (-RemoveOld removes it after verification).' }
+        $result = 'OK'
+        $script:RenewExitCode = 0
+        Write-Log 'Renewal completed.' OK
+    }
+    catch { Write-Log "Renewal FAILED: $($_.Exception.Message)" ERROR }
+    finally { if ($result -ne 'NOTNEEDED') { Send-RenewalReport -Result $result } }
+}
+
+# ---------------------------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------------------------
 [xml]$xaml = @'
@@ -2084,13 +2989,15 @@ function Show-LePluginParams {
             <TextBlock DockPanel.Dock="Top" Text="Mailbox servers (multi-select):" Margin="0,0,0,4"/>
             <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
               <Button x:Name="ReloadServersButton" Content="Reload server list" Margin="0,0,0,6"/>
-              <Button x:Name="RefreshButton" Content="Refresh certificate inventory"/>
+              <Button x:Name="RefreshButton" Content="Refresh certificate inventory" Margin="0,0,0,6"/>
+              <Button x:Name="AuthRenewButton" Content="Renew / copy Auth certificate..." Margin="0"
+                      ToolTip="Copies the Auth (OAuth) certificate to selected servers that miss it, or - when fewer than 60 days are left - creates a new one and makes it current (Set-AuthConfig)."/>
             </StackPanel>
             <ListBox x:Name="ServerList" SelectionMode="Multiple"/>
           </DockPanel>
           <DockPanel Grid.Column="1">
             <TextBlock DockPanel.Dock="Top" TextWrapping="Wrap" Foreground="DimGray"
-                       Text="Read-only. Role column: Auth = OAuth certificate, InternalTransport = default SMTP certificate, NEW = the validated PFX."/>
+                       Text="Read-only. Role column: Auth = OAuth certificate, InternalTransport = default SMTP certificate, NEW = the validated PFX. The log warns when the Auth certificate expires within 60 days or is missing on a server."/>
             <DataGrid x:Name="InventoryGrid"/>
           </DockPanel>
         </Grid>
@@ -2181,7 +3088,7 @@ function Show-LePluginParams {
 
       <TabItem Header="2. New certificate">
         <Grid Margin="8">
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
           <Grid.ColumnDefinitions><ColumnDefinition Width="110"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
           <TextBlock Text="PFX file:" VerticalAlignment="Center"/>
           <TextBox x:Name="PfxPathBox" Grid.Column="1" Margin="4"/>
@@ -2198,7 +3105,12 @@ function Show-LePluginParams {
             <Button x:Name="RefreshInstalledButton" DockPanel.Dock="Right" Margin="4" Content="Refresh"/>
             <ComboBox x:Name="InstalledCertCombo" Margin="4" FontFamily="Consolas"/>
           </DockPanel>
-          <TextBox x:Name="ValidationBox" Grid.Row="4" Grid.ColumnSpan="3" Margin="0,8,0,0" IsReadOnly="True" FontFamily="Consolas"
+          <TextBlock Grid.Row="4" Text="Or CSR:" VerticalAlignment="Center" ToolTip="Commercial or internal CA (AD CS): create a request on the first selected server, then import the issued certificate"/>
+          <WrapPanel Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2" Margin="0,4,0,0">
+            <Button x:Name="CsrCreateButton" Margin="4" Content="Create CSR (names from tab 1b)..."/>
+            <Button x:Name="CsrCompleteButton" Margin="4" Content="Complete pending request (.cer / .p7b)..."/>
+          </WrapPanel>
+          <TextBox x:Name="ValidationBox" Grid.Row="5" Grid.ColumnSpan="3" Margin="0,8,0,0" IsReadOnly="True" FontFamily="Consolas"
                    VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" TextWrapping="NoWrap"/>
         </Grid>
       </TabItem>
@@ -2209,6 +3121,7 @@ function Show-LePluginParams {
           <TextBlock TextWrapping="Wrap" Text="Step A imports the validated PFX into every selected server (the same PFX on each server, so all get the identical certificate and private key). Step B enables it for IIS and SMTP. The Exchange Back End website (port 444) keeps its self-signed certificate. Nothing is removed here - the old certificate stays until tab 5."/>
           <CheckBox x:Name="ExportableCheck" Margin="0,14,0,0" Content="Mark private key as exportable on the servers (only if you need to export it from Exchange later)"/>
           <CheckBox x:Name="ReplaceInternalCheck" Margin="0,6,0,0" Content="Also replace the internal transport (default SMTP) certificate - normally leave unchecked"/>
+          <CheckBox x:Name="PopImapCheck" Margin="0,6,0,0" Content="Also enable it for POP3 and IMAP4 (only if clients use them: sets X509CertificateName if needed and restarts the POP/IMAP services)"/>
           <StackPanel Orientation="Horizontal" Margin="0,18,0,0">
             <Button x:Name="ImportButton" Content="Step A: Import PFX to selected servers"/>
             <Button x:Name="EnableButton" Content="Step B: Enable for IIS + SMTP"/>
@@ -2217,7 +3130,7 @@ function Show-LePluginParams {
                      Text="Recommended: run every step once with 'Dry run' ticked and read the log, then untick 'Dry run' and run them for real."/>
           <TextBlock Margin="0,22,0,4" FontWeight="Bold" Text="Step C: SMTP connectors (TlsCertificateName)"/>
           <TextBlock TextWrapping="Wrap" Foreground="DimGray"
-                     Text="Updates Send/Receive connectors that are pinned to the old certificate (e.g. hybrid 'Outbound to Office 365' and 'Default Frontend' set by the HCW), and can pin the new certificate on the frontend receive connectors. Without a pinned certificate, the 'Default Frontend' connector offers the certificate that matches its FQDN - usually the server's self-signed one - to internet senders. The connector FQDN is never changed (that can break Kerberos between Exchange servers). Run after Step B."/>
+                     Text="Updates Send/Receive connectors and the hybrid configuration (HCW) that are pinned to the old certificate (e.g. hybrid 'Outbound to Office 365' and 'Default Frontend' set by the HCW), and can pin the new certificate on the frontend receive connectors. Without a pinned certificate, the 'Default Frontend' connector offers the certificate that matches its FQDN - usually the server's self-signed one - to internet senders. The connector FQDN is never changed (that can break Kerberos between Exchange servers). Run after Step B."/>
           <CheckBox x:Name="PinFrontendCheck" Margin="0,8,0,0" IsChecked="True" Content="Pin the new certificate on 'Default Frontend' receive connectors (port 25, internet mail / STARTTLS)"/>
           <CheckBox x:Name="PinClientCheck" Margin="0,4,0,0" Content="Also pin it on 'Client Frontend' receive connectors (port 587, authenticated SMTP submission)"/>
           <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
@@ -2225,6 +3138,13 @@ function Show-LePluginParams {
             <Button x:Name="ConnectorUpdateButton" Content="Step C: Update connectors"/>
           </StackPanel>
           <DataGrid x:Name="ConnectorGrid" Height="190"/>
+          <TextBlock Margin="0,22,0,4" FontWeight="Bold" Text="Roll back / Edge Transport"/>
+          <TextBlock TextWrapping="Wrap" Foreground="DimGray"
+                     Text="Steps B and C first save the current configuration to logs\Snapshot_*.json. Roll back restores the IIS certificate, internal transport certificate, connector and hybrid TlsCertificateName and POP/IMAP names from a snapshot (the old certificate must still be installed). The Edge package is a folder with the PFX and a script to run on each Edge Transport server, which this tool cannot reach."/>
+          <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+            <Button x:Name="RollbackButton" Content="Roll back from snapshot..."/>
+            <Button x:Name="EdgePackageButton" Content="Create Edge Transport package..."/>
+          </StackPanel>
         </StackPanel>
         </ScrollViewer>
       </TabItem>
@@ -2234,6 +3154,8 @@ function Show-LePluginParams {
           <StackPanel DockPanel.Dock="Top">
             <TextBlock Text="Extra TLS endpoints to probe, e.g. load balancer / public name (host or host:port, comma-separated):"/>
             <DockPanel Margin="0,4,0,0">
+              <Button x:Name="RestartButton" DockPanel.Dock="Right" Margin="8,0,0,0" Content="Rolling restart..."
+                      ToolTip="iisreset /noforce and restart Frontend Transport, one server at a time, waiting for port 443 between servers"/>
               <Button x:Name="VerifyButton" DockPanel.Dock="Right" Margin="8,0,0,0" Content="Run verification (read-only)"/>
               <TextBox x:Name="ExtraEndpointsBox"/>
             </DockPanel>
@@ -2278,6 +3200,7 @@ function New-MainWindow {
 }
 
 $script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'LoadAcmeButton', 'UseInstalledButton', 'RefreshInstalledButton', 'ImportButton', 'EnableButton', 'ConnectorPreviewButton', 'ConnectorUpdateButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
+'AuthRenewButton', 'CsrCreateButton', 'CsrCompleteButton', 'RollbackButton', 'EdgePackageButton', 'RestartButton',
 'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeCfTestButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
@@ -2332,6 +3255,12 @@ function Register-UiEvents {
     $ui.VerifyButton.Add_Click({ Invoke-UiAction 'Verify' { Invoke-Verify } })
     $ui.LoadOldButton.Add_Click({ Invoke-UiAction 'Load candidates' { Update-OldCandidates } })
     $ui.RemoveButton.Add_Click({ Invoke-UiAction 'Remove' { Invoke-RemoveOld } })
+    $ui.AuthRenewButton.Add_Click({ Invoke-UiAction 'Auth certificate' { Invoke-AuthCertificate } })
+    $ui.CsrCreateButton.Add_Click({ Invoke-UiAction 'Create CSR' { New-CertificateRequest } })
+    $ui.CsrCompleteButton.Add_Click({ Invoke-UiAction 'Complete pending request' { Complete-CertificateRequest } })
+    $ui.RollbackButton.Add_Click({ Invoke-UiAction 'Roll back' { Invoke-Rollback } })
+    $ui.EdgePackageButton.Add_Click({ Invoke-UiAction 'Edge package' { New-EdgePackage } })
+    $ui.RestartButton.Add_Click({ Invoke-UiAction 'Rolling restart' { Invoke-RollingRestart } })
     $ui.LeInstallModuleButton.Add_Click({ Invoke-UiAction 'Install Posh-ACME' { Install-PoshAcme } })
     $ui.LeFillNamesButton.Add_Click({ Invoke-UiAction 'Fill names' { Set-LeNamesFromExchange } })
     $ui.LeFillCertButton.Add_Click({ Invoke-UiAction 'Fill from certificate' { [void](Set-LeNamesFromCurrentCert) } })
@@ -2392,6 +3321,12 @@ if (-not (Test-ExchangeAvailable)) {
     catch { Write-Log "Exchange snap-in not available: $($_.Exception.Message)" WARN }
 }
 if (Test-ExchangeAvailable) { Write-Log 'Exchange cmdlets available.' OK }
+
+if ($Renew) {
+    Invoke-UnattendedRenewal
+    Write-Log "Renewal run finished (exit code $script:RenewExitCode). Log: $script:LogFile"
+    exit $script:RenewExitCode
+}
 
 New-MainWindow
 $script:ui.LogBox.Text = (Get-Content -LiteralPath $script:LogFile -Raw)

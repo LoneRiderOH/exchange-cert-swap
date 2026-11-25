@@ -11,16 +11,23 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
   - **DNS-01 manual**: the tool shows the `_acme-challenge` TXT records to create, then checks public DNS before continuing. Supports wildcards.
   - **DNS-01 automatic via Cloudflare**: built-in option for domains hosted on Cloudflare DNS. You paste a scoped API token, and the tool tests it, creates and removes the TXT records itself, and can remember the token, encrypted for your Windows user. It also detects when your names are on Cloudflare DNS.
   - **DNS-01 automatic via other DNS hosts**: uses any of Posh-ACME's ~90 DNS provider plugins (Route 53, Azure DNS, GoDaddy and more).
-- **Inventory**: lists every Exchange certificate on all selected mailbox servers and marks the **Auth (OAuth)** and **internal transport** certificates.
+- **Certificates from a commercial or internal CA**: creates a CSR on an Exchange server and completes it with the issued certificate. See [Commercial or internal CA (CSR)](#commercial-or-internal-ca-csr).
+- **Inventory**: lists every Exchange certificate on all selected mailbox servers and marks the **Auth (OAuth)** and **internal transport** certificates. The log warns when the Auth certificate expires within 60 days or is missing on a server.
+- **Auth (OAuth) certificate**: renews it, or copies it to servers that lack it. See [Auth (OAuth) certificate](#auth-oauth-certificate).
 - **Validation before changes (read-only)**:
   - the PFX contains a private key, is in its validity period and has the Server Authentication EKU
   - the chain builds to a trusted root
   - every `InternalUrl`/`ExternalUrl` on the OWA, ECP, EWS, OAB, ActiveSync and MAPI virtual directories, plus the Autodiscover SCP, is covered by the certificate's SANs (wildcards are handled correctly)
-  - lists Send and Receive connectors whose `TlsCertificateName` still points to the old certificate
+  - lists Send and Receive connectors and the hybrid configuration whose `TlsCertificateName` still points to the old certificate
+  - **mail flow**: the hybrid certificate name, your MX host names and their **DANE** TLSA records, and the Client Authentication EKU. See [Mail flow checks](#mail-flow-checks).
 - **Import to multiple servers**: imports the **same PFX** on every selected server with `Import-ExchangeCertificate -FileData`, so the tool doesn't need to be run on each server.
-- **SMTP connectors**: updates Send and Receive connectors whose `TlsCertificateName` points to the old certificate, such as the hybrid *Outbound to Office 365* and *Default Frontend* connectors set by the HCW. It can also pin the new certificate on the **Default Frontend** connector (port 25), so internet senders get the public certificate on STARTTLS instead of the self-signed one. The connector FQDN is never changed, and rollback commands are logged.
-- **Enable for IIS and SMTP**: if `Enable-ExchangeCertificate -Force` replaces the **internal transport certificate**, the tool restores the previous one unless you choose otherwise.
-- **Verification on the network**: opens a real TLS connection to each server on port 443 and compares the served thumbprint with the new certificate. It also checks SMTP port 25 with STARTTLS (for information only) and any extra endpoints you list, such as a load balancer or public name.
+- **SMTP connectors and hybrid**: updates Send and Receive connectors and the hybrid configuration (`Set-HybridConfiguration`) whose `TlsCertificateName` points to the old certificate, such as the hybrid *Outbound to Office 365* and *Default Frontend* connectors set by the HCW. It can also pin the new certificate on the **Default Frontend** connector (port 25), so internet senders get the public certificate on STARTTLS instead of the self-signed one. The connector FQDN is never changed, and rollback commands are logged.
+- **Enable for IIS and SMTP** (and optionally **POP3/IMAP4**): if `Enable-ExchangeCertificate -Force` replaces the **internal transport certificate**, the tool restores the previous one unless you choose otherwise.
+- **Rollback snapshots**: Steps B and C save the current configuration first, and one button restores it. See [Rollback](#rollback).
+- **Edge Transport**: creates a folder with the PFX and an install script for Edge servers. See [Edge Transport servers](#edge-transport-servers).
+- **Verification on the network**: opens a real TLS connection to each server on port 443 and compares the served thumbprint with the new certificate. It also checks SMTP port 25 with STARTTLS (for information only), POP3 (995) and IMAP4 (993) when the certificate is enabled for them, and any extra endpoints you list, such as a load balancer or public name. An extra endpoint that serves a different certificate is a **FAIL**: with Extended Protection, which is on by default since Exchange 2019 CU14, Windows authentication through it breaks.
+- **Rolling restart**: `iisreset /noforce` and a Frontend Transport restart, one server at a time, waiting until each server answers on 443 again.
+- **Automatic renewal**: `-Renew` renews a free certificate from a scheduled task and installs it on all servers. See [Automatic renewal](#automatic-renewal--renew).
 - **Safe removal of the old certificate**: a certificate is removed only if:
   - its server passed verification
   - it is not the Auth or internal transport certificate
@@ -29,7 +36,7 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 
   You confirm each removal.
 - **Dry run by default**: every command is logged instead of being run. You turn Dry run off on purpose, and the header switches to red **LIVE MODE**.
-- **Full log**: each run writes `logs\CertSwap_<timestamp>.log` next to the script. PFX passwords are never logged.
+- **Full log**: each run writes `logs\CertSwap_<timestamp>.log` next to the script (`CertRenew_<timestamp>.log` for `-Renew`). PFX passwords are never logged.
 - **No private key is written to the machine that runs the tool**: the PFX is opened with `EphemeralKeySet`, so its key stays in memory. It never goes into a Windows key store or onto a smart card or hardware token. The key is installed only on the Exchange servers, through `Import-ExchangeCertificate`.
 
 ## Requirements
@@ -41,11 +48,11 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 | PowerShell | **Windows PowerShell 5.1** (`powershell.exe`, not PowerShell 7), run as administrator |
 | .NET Framework | 4.7.2 or newer |
 | Permissions | Organization Management (or a role that can manage Exchange certificates, connectors and transport services) |
-| Network | From the machine running the tool to each server's FQDN on TCP 443 (and 25 for the SMTP check) |
+| Network | From the machine running the tool to each server's FQDN on TCP 443 (and 25 for the SMTP check, 995/993 for POP/IMAP). **PowerShell remoting** (WinRM, 5985) to each server for the Auth certificate renewal and the rolling restart. Outbound HTTPS to `dns.google` or `cloudflare-dns.com` for the DANE check (skipped if blocked). |
 | Certificate | A PFX (`.pfx`/`.p12`) **with private key**, ideally including the intermediate CA certificates, **or** a free ACME certificate (see below) |
 | Free certificates only | The [Posh-ACME](https://www.powershellgallery.com/packages/Posh-ACME) module (the tool can install it), outbound HTTPS to the CA's ACME server, and public DNS names. HTTP-01 also needs inbound port 80 from the internet to the Exchange servers and admin share access (`\\server\C$`) to each server. |
 
-**Not supported:** Edge Transport servers (they aren't in Active Directory; import their certificate locally and recreate the Edge subscription), and Exchange 2013 or older.
+**Not supported:** Exchange 2013 or older. Edge Transport servers aren't in Active Directory, so the tool can't reach them; it creates an [install package](#edge-transport-servers) for them instead.
 
 ## Quick start
 
@@ -65,11 +72,11 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 
 | Tab | What happens | Changes anything? |
 |---|---|---|
-| **1. Servers & inventory** | Select the mailbox servers to work on (all are selected by default). Review the current certificates. | No |
+| **1. Servers & inventory** | Select the mailbox servers to work on (all are selected by default). Review the current certificates. **Renew / copy Auth certificate** handles the OAuth certificate; see [Auth (OAuth) certificate](#auth-oauth-certificate). | No (except the Auth button) |
 | **1b. Free certificate (ACME)** *(optional)* | Request a free certificate instead of bringing a PFX. See [Free certificates](#free-certificates-acme) below. When it is issued, the PFX is loaded into tab 2 and validated automatically. | Yes (unless Dry run) |
-| **2. New certificate** | Browse to the PFX, enter its password and click **Validate**. Read the report. Missing host names and connectors that point to the old certificate appear as warnings. If you don't have the PFX, there are two other ways to pick the certificate; see [Certificate already issued or installed](#certificate-already-issued-or-installed). | No |
-| **3. Import & enable** | **Step A**: import the PFX on all selected servers. **Step B**: enable it for IIS and SMTP. **Step C**: update the SMTP connectors (see [SMTP connectors](#smtp-connectors-default-frontend)). The old certificate stays on the servers. | Yes |
-| **4. Verify** | Checks that Exchange has the new certificate enabled for IIS and SMTP and that it is served on port 443. You can add extra endpoints, such as `mail.contoso.com` or a load balancer address, to check too. | No |
+| **2. New certificate** | Browse to the PFX, enter its password and click **Validate**. Read the report. Missing host names, connectors that point to the old certificate and [mail flow problems](#mail-flow-checks) appear as warnings. If you don't have the PFX, there are other ways to pick the certificate; see [Certificate already issued or installed](#certificate-already-issued-or-installed) and [Commercial or internal CA (CSR)](#commercial-or-internal-ca-csr). | No (except the CSR buttons) |
+| **3. Import & enable** | **Step A**: import the PFX on all selected servers. **Step B**: enable it for IIS and SMTP, and for POP3/IMAP4 if you tick that option. **Step C**: update the SMTP connectors and the hybrid configuration (see [SMTP connectors](#smtp-connectors-default-frontend)). The old certificate stays on the servers. Below the steps: [Roll back from snapshot](#rollback) and [Create Edge Transport package](#edge-transport-servers). | Yes |
+| **4. Verify** | Checks that Exchange has the new certificate enabled for IIS and SMTP and that it is served on port 443 (and 995/993 for POP/IMAP). You can add extra endpoints, such as `mail.contoso.com` or a load balancer address, to check too; they must serve the new certificate. **Rolling restart** restarts IIS and Frontend Transport one server at a time if a server still serves the old certificate. | No (except Rolling restart) |
 | **5. Remove old certificate** *(optional)* | Click **Load candidates**. The `Blockers` column shows why a certificate can't be removed yet. Select the rows to remove and confirm. | Yes |
 
 ## Certificate already issued or installed
@@ -79,6 +86,31 @@ If you closed the tool after issuing or enabling a certificate, for example befo
 - **Load last Let's Encrypt/ACME certificate** finds the certificates Posh-ACME saved for the current Windows user, in `%LOCALAPPDATA%\Posh-ACME\…\fullchain.pfx` (or `POSHACME_HOME` if set). It loads the newest one with its saved PFX password and validates it. The log lists all the certificates it found, newest first.
 - **Or installed → Use installed certificate** uses a certificate that is **already in Exchange**. The list contains every CA-issued certificate on the selected servers, with the one bound to IIS and expiring last at the top. No PFX is needed. You can then run Step B or Step C on tab 3, **Verify** on tab 4 and **Remove old** on tab 5 as usual.
   - If the certificate is installed on only some of the servers, **Step A** copies it to the others. It does this with `Export-ExchangeCertificate` from a server where the private key is **exportable**. If the key isn't exportable, which is the default, Step A says so, and you need the original PFX: use **Load last Let's Encrypt/ACME certificate**, or tick *Mark private key as exportable* the next time you import.
+
+## Commercial or internal CA (CSR)
+
+For a certificate from DigiCert, Sectigo, GlobalSign and so on, or from your own AD CS, tab 2 has **Or CSR**:
+
+1. Enter the names in the names list on **tab 1b** (the first one becomes the subject CN). Unlike ACME, internal names are allowed here, for internal CAs.
+2. Click **Create CSR (names from tab 1b)...** and choose where to save the `.req` file. The key pair is created on the **first selected server**, with an exportable private key, so Step A can copy the issued certificate to the other servers later.
+3. Submit the `.req` to your CA. For AD CS, the log shows the `certreq -submit -attrib "CertificateTemplate:WebServer" …` command.
+4. Click **Complete pending request (.cer / .p7b)...** and pick the issued file (`.cer`, `.crt`, `.p7b` or `.pem`; not a PFX). The tool finds the server whose pending request has the same CN, imports the certificate there, checks that it has its private key, and then uses it like **Use installed certificate**. Continue with tab 3.
+
+If the CA sent an intermediate certificate, it must be in the *Intermediate Certification Authorities* store of every server. The chain check on tab 2 shows whether it's missing.
+
+## Auth (OAuth) certificate
+
+Exchange signs OAuth tokens with the self-signed *Microsoft Exchange Server Auth Certificate*. It is valid for 5 years, and when it expires or is missing on a server, OWA/ECP sign-in, hybrid free/busy and other OAuth features fail. The inventory on tab 1 logs a warning when it expires within 60 days or is missing on a selected server.
+
+**Renew / copy Auth certificate...** on tab 1:
+
+| Situation | What it does |
+|---|---|
+| Valid for 60 days or more, on every selected server | Nothing |
+| Valid for 60 days or more, missing on some selected servers | Copies it there (`Export-ExchangeCertificate` / `Import-ExchangeCertificate`) |
+| Expires within 60 days, expired or missing | Creates a new one with `New-ExchangeCertificate` on the first selected server, copies it to all selected servers, then runs `Set-AuthConfig -NewCertificateThumbprint … -NewCertificateEffectiveDate (Get-Date)`, `-PublishCertificate` and `-ClearPreviousCertificate`. Finally it restarts *MSExchangeServiceHost* and recycles the OWA and ECP app pools on each server through PowerShell remoting. |
+
+Select **all** Exchange servers on tab 1 first; the confirmation warns about servers that aren't selected. `Set-AuthConfig` is changed only after the new certificate is on every selected server, and the log contains the rollback command. In a **hybrid** deployment, rerun the Hybrid Configuration Wizard afterwards so Exchange Online trusts the new certificate. Tab 5 never removes the current, previous or next Auth certificate.
 
 ## SMTP connectors (Default Frontend)
 
@@ -96,7 +128,44 @@ If a receive connector has no `TlsCertificateName`, Exchange offers the certific
 
 Use **Preview connector changes** to see the plan, which is also shown after validation. Step C refuses to pin a certificate on a server where it isn't enabled for SMTP yet: run Step B first, otherwise STARTTLS stops working (event 12014). For every change, the log contains the rollback command with the previous value. After Step C, wait a few minutes for transport to pick up the change, then run **tab 4**. The *SMTP :25 STARTTLS* check passes when the new certificate is served, and fails if the connector is pinned but the old certificate is still offered.
 
+Step C also updates the **hybrid configuration** (`Get-HybridConfiguration`) when its `TlsCertificateName` points to the old certificate, so the next HCW run doesn't put the old certificate back.
+
 Tab 5 won't remove the old certificate while any connector still points to it.
+
+## POP3 and IMAP4
+
+Tick *Also enable it for POP3 and IMAP4* on tab 3 only if clients use them. Step B then enables the certificate for POP and IMAP too. If `X509CertificateName` in `Get-PopSettings`/`Get-ImapSettings` is not a name on the new certificate, the tool sets it to the first non-wildcard name (the log contains the previous value), and it restarts the POP3 and IMAP4 services that are running. Tab 4 then checks ports 995 and 993.
+
+## Mail flow checks
+
+Validation on tab 2 also checks things that break mail flow even though the certificate is otherwise fine. In the GUI they are warnings in the report; [automatic renewal](#automatic-renewal--renew) stops before changing Exchange.
+
+| Check | Problem when |
+|---|---|
+| **Hybrid** | The CN in the hybrid configuration's `TlsCertificateName` is not on the new certificate. Exchange Online usually checks this name on mail from on-premises. |
+| **MX** | An MX host of an authoritative accepted domain (up to 20 domains) is on the current certificate but not on the new one. MX hosts that aren't on either certificate, such as Exchange Online Protection or a mail gateway, are ignored. |
+| **DANE** | `_25._tcp.<mx>` has TLSA records, and none matches the new certificate. The report shows the `3 1 1` record to publish. Publish it next to the existing record and wait for its TTL before Step B and C, or DANE-validating senders, including Exchange Online, stop delivering. |
+| **Client Authentication EKU** (warning only) | The current certificate has it and the new one doesn't. Exchange also presents this certificate as a client on outgoing SMTP, so partners that require mutual TLS may reject it. Public CAs are phasing this EKU out. |
+
+`Resolve-DnsName` can't query TLSA records, so the DANE check uses DNS-over-HTTPS at `dns.google`, then `cloudflare-dns.com`. If neither is reachable, the check is skipped with an INFO line.
+
+## Rollback
+
+Before Step B and before Step C change anything, the tool saves the current configuration to `logs\Snapshot_<timestamp>_before-StepB.json` (or `before-StepC`). The snapshot holds, per server, the IIS certificate, the internal transport certificate and the POP/IMAP `X509CertificateName`, plus the `TlsCertificateName` of all Send connectors, the Receive connectors of the selected servers and the hybrid configuration.
+
+**Roll back from snapshot...** on tab 3 compares the current configuration with the snapshot you choose, shows the commands that restore it, and runs them after you confirm (Dry run applies). Only values that differ are changed. The new certificate stays installed. IIS can only go back to a certificate that is still installed, so keep the old certificate until you're sure: once tab 5 has removed it, the log says that IIS can't be rolled back on that server.
+
+## Edge Transport servers
+
+Edge servers aren't in Active Directory, so the tool can't import the certificate on them. After you validate a **PFX** on tab 2, **Create Edge Transport package...** on tab 3 creates `logs\EdgePackage_<timestamp>` with `certificate.pfx` and `Install-EdgeCertificate.ps1`. Copy the folder to each Edge server and run the script in an elevated Exchange Management Shell:
+
+```powershell
+.\Install-EdgeCertificate.ps1 -WhatIf                   # show what would happen
+.\Install-EdgeCertificate.ps1                           # import (asks for the PFX password) and enable for SMTP
+.\Install-EdgeCertificate.ps1 -UpdatePinnedConnectors   # also switch receive connectors pinned to another certificate
+```
+
+The script keeps the internal transport certificate, so the Edge Subscription stays valid and doesn't need to be recreated. The PFX password is not stored in the package. **Delete the folder afterwards**: it contains the private key. The package needs the PFX file, so it isn't available with *Use installed certificate*.
 
 ## Free certificates (ACME)
 
@@ -157,24 +226,66 @@ Proxied (orange-cloud) records don't matter, because DNS-01 only uses TXT record
 
 Posh-ACME keeps the account, the orders and the issued files in `%LOCALAPPDATA%\Posh-ACME` for the user who ran the tool. The log shows the PFX path. The PFX password is stored with the order: `(Get-PAOrder <name>).PfxPass`.
 
-**Renewal:** these certificates are valid for 90 days at most, and the industry maximum keeps shrinking (47 days by 2029). Run the tool again about every 60 days: request, validate, import and enable on tabs 1b to 4, then remove the old certificate on tab 5. Renewal is not automatic.
+**Renewal:** these certificates are valid for 90 days at most, and the industry maximum keeps shrinking (47 days by 2029). Either run the tool again about every 60 days (request, validate, import and enable on tabs 1b to 4, then remove the old certificate on tab 5), or set up [automatic renewal](#automatic-renewal--renew).
 
 **Rate limits:** Let's Encrypt production allows 5 duplicate certificates per week and 50 certificates per registered domain per week. Other CAs have their own limits. Test on Staging first.
 
+## Automatic renewal (-Renew)
+
+`-Renew` runs the same steps as the GUI without showing it, for a scheduled task. It renews free ACME certificates only.
+
+**One-time setup**
+
+1. In the GUI, as the Windows user that will run the task, request a certificate from a **production** CA with **HTTP-01**, **Cloudflare** or a **DNS plugin** (DNS-01 manual can't run unattended), with **all** mailbox servers selected. For Cloudflare, tick **Remember the token**. When the certificate is issued, the tool saves the settings to `%LOCALAPPDATA%\ExchangeCertTool\renewal.json`: CA, names, challenge type, key length, e-mail and servers. Plugin arguments are encrypted with DPAPI.
+2. Try it in dry run, which logs what it would do and changes nothing:
+
+   ```powershell
+   powershell.exe -STA -ExecutionPolicy Bypass -File .\ExchangeCertTool.ps1 -Renew -ForceRenew
+   ```
+
+3. Create the scheduled task. It must run as the **same user** as step 1, because the Posh-ACME account, the Cloudflare token and the settings are stored in that user's profile, encrypted for that user:
+
+   ```powershell
+   $cred    = Get-Credential 'CONTOSO\svc-exchcert'
+   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -STA -ExecutionPolicy Bypass -File "C:\Scripts\ExchangeCertTool.ps1" -Renew -Live -RemoveOld -NotifyTo admin@contoso.com'
+   $trigger = New-ScheduledTaskTrigger -Daily -At 3am
+   Register-ScheduledTask -TaskName 'Exchange certificate renewal' -Action $action -Trigger $trigger -RunLevel Highest -User $cred.UserName -Password $cred.GetNetworkCredential().Password
+   ```
+
+   A daily run is fine: it ends at once while the current certificate has more than `-RenewDays` (30) days left.
+
+**What a run does**
+
+1. Checks the days left on the certificate bound to IIS on the saved servers. With 30 days or more left, it stops (exit code 0, no e-mail).
+2. Reuses a certificate that an earlier run already issued but didn't install, so repeated failures don't use up the CA's rate limits. Otherwise it requests a new one with the saved settings.
+3. Validates it. It **stops before changing Exchange** if the new certificate no longer covers a name that the current one covers, or if a [mail flow check](#mail-flow-checks) finds a problem.
+4. Runs Step A, B and C. Step C only switches connectors that are pinned to the old certificate; it doesn't pin new ones. POP/IMAP is included only if the old certificate was enabled for it. If a step logs an error, the run stops; the snapshot from Step B or C can be restored on tab 3 with **Roll back**.
+5. Verifies every server, retrying once after 2 minutes.
+6. With `-RemoveOld`, removes the previous IIS certificate, with the same safety checks as tab 5.
+7. With `-NotifyTo`, e-mails the log (subject `[ExchangeCertTool] Certificate renewal OK|FAILED|DRYRUN on <server>`).
+
+Without `-Live`, the run is a dry run: it stops before the ACME request (or, if it can reuse a saved certificate, after logging Steps A to C). Exit code 0 means renewed, nothing to do, or dry run; 1 means it failed. Servers added to the organization after the setup aren't included: the log warns about them, and you repeat step 1 with all servers selected.
+
 ## Things to know
 
-- **Port 443 still serves the old certificate after enabling.** Check the HTTPS binding on *Default Web Site* in IIS Manager. If the binding is correct, run `iisreset /noforce` during a quiet period.
+- **Port 443 still serves the old certificate after enabling.** Check the HTTPS binding on *Default Web Site* in IIS Manager. If the binding is correct, click **Rolling restart...** on tab 4 during a quiet period (or run `iisreset /noforce` on each server).
 - **Port 25 still shows the old or self-signed certificate.** Run tab 3, Step C, which pins the new certificate on *Default Frontend*. If tab 4 still shows the old certificate a few minutes after Step C, restart the *Microsoft Exchange Frontend Transport* service during a quiet period.
 - **Internal names such as `.local`**: public CAs can't issue certificates for them. Change the `InternalUrl` values to a public name that is on the certificate, and use split DNS. The tool lists these names during validation.
-- **Load balancers or reverse proxies that terminate TLS** (HAProxy, F5, KEMP, NGINX and so on) need the new certificate installed on them separately. Add their address on tab 4 to check it.
-- **Hybrid deployments**: if your *Outbound to Office 365* connector or the receive connectors point to the old certificate, update them before removing it, and rerun the Hybrid Configuration Wizard if your process requires it.
+- **Load balancers or reverse proxies that terminate TLS** (HAProxy, F5, KEMP, NGINX and so on) need the new certificate installed on them separately. Add their address on tab 4 to check it. With Extended Protection on (the default since Exchange 2019 CU14), they must serve the **same** certificate as Exchange, or Windows authentication through them fails, so tab 4 reports a different certificate as FAIL.
+- **Hybrid deployments**: Step C updates the connectors and the hybrid configuration that point to the old certificate. Rerun the Hybrid Configuration Wizard if your process requires it.
 - **Posh-ACME shows "NOT found" although you installed it**: check the folder list in the log. Common causes are installing it from PowerShell 7 (`pwsh`) as a *different* user than the one running the tool, or a server with no internet access. For offline servers, run `Save-Module Posh-ACME -Path .\Modules` on another machine and copy the `Modules` folder next to `ExchangeCertTool.ps1`. If loading fails because of the execution policy, the log shows the policy that applies.
 - **HTTP-01 fails with 403**: *Require SSL* is set on the root of *Default Web Site*. Use DNS-01, or allow HTTP for `/.well-known/acme-challenge` only.
-- The **Exchange Back End** site (port 444) and the **Auth certificate** are never changed by this tool.
+- The **Exchange Back End** site (port 444) is never changed. The **Auth certificate** changes only when you click **Renew / copy Auth certificate** on tab 1.
 
 ## Testing without Exchange
 
-Dot-source the script with `-LoadOnly`. This defines the functions and builds the window without connecting to Exchange or showing it, so you can supply mock Exchange cmdlets:
+`tests\Test-ExchangeCertTool.ps1` runs the tool against mock Exchange cmdlets (two servers, sample certificates and connectors). It needs no Exchange and no network, and it doesn't create certificates or keys. It covers the inventory, validation of an installed certificate, the mail flow checks, Steps B and C, snapshots and rollback, the Auth certificate, the Edge package and an unattended renewal. It prints PASS/FAIL per check and exits with 1 if any check fails:
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\Test-ExchangeCertTool.ps1
+```
+
+For your own experiments, dot-source the script with `-LoadOnly`. This defines the functions and builds the window without connecting to Exchange or showing it, so you can supply mock Exchange cmdlets:
 
 ```powershell
 . .\ExchangeCertTool.ps1 -LoadOnly -LogDirectory $env:TEMP\certtool
@@ -188,6 +299,14 @@ Dot-source the script with `-LoadOnly`. This defines the functions and builds th
 |---|---|
 | `-LogDirectory <path>` | Folder for log files. Default: `.\logs` next to the script |
 | `-LoadOnly` | Load the functions and build the window without connecting to Exchange or showing it (for testing) |
+| `-Renew` | [Automatic renewal](#automatic-renewal--renew) without the GUI, for a scheduled task. Dry run unless `-Live` is given |
+| `-Live` | With `-Renew`: make the changes |
+| `-RemoveOld` | With `-Renew`: remove the previous IIS certificate after every server passed verification |
+| `-RenewDays <n>` | With `-Renew`: renew when the current certificate has fewer days left. Default: 30 |
+| `-ForceRenew` | With `-Renew`: renew now, whatever the days left |
+| `-NotifyTo <address[]>` | With `-Renew`: e-mail the log to these addresses when a renewal ran, failed or was a dry run |
+| `-NotifyFrom <address>` | With `-Renew`: sender address. Default: `ExchangeCertTool@<default accepted domain>` |
+| `-SmtpServer <host>` | With `-Renew`: SMTP server for the e-mail. Default: `localhost` (the Exchange server itself) |
 
 ## Disclaimer
 
