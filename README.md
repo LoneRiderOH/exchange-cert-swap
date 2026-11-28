@@ -144,6 +144,8 @@ Use **Preview connector changes** to see the plan, which is also shown after val
 
 Step C also updates the **hybrid configuration** (`Get-HybridConfiguration`) when its `TlsCertificateName` points to the old certificate, so the next HCW run doesn't put the old certificate back.
 
+If the hybrid configuration points to a **different certificate than the hybrid send connector** (*Outbound to Office 365*), Step C shows the row as **align**. This often happens after connectors were updated by hand with `Set-SendConnector` / `Set-ReceiveConnector` only. The HCW starts from that value, so a rerun would pin the connectors to a certificate that may no longer be installed. **align** sets the hybrid configuration to whatever the send connector uses after Step C, provided that certificate is installed or is the new one. Otherwise the row stays **none** and the note asks you to check both. Mail flow doesn't change, since only the stored setting is changed. Like the other rows, it is confirmed, snapshotted and can be rolled back.
+
 Tab 5 won't remove the old certificate while any connector still points to it.
 
 ## Hybrid (Exchange Online)

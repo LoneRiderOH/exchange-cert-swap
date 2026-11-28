@@ -648,6 +648,13 @@ function Get-ConnectorTlsReport {
 # ---------------------------------------------------------------------------------------------
 # Step 3C: SMTP connectors (TlsCertificateName)
 # ---------------------------------------------------------------------------------------------
+# Two TlsCertificateName values ("<I>issuer<S>subject") name the same certificate.
+function Test-TlsNameEqual {
+    param([string]$A, [string]$B)
+    if ($B -notmatch '^<I>(.*?)<S>(.*)$') { return ($A -eq $B) }
+    Test-TlsNameMatches $A $Matches[1] $Matches[2]
+}
+
 function Test-TlsNameMatches {
     param([string]$Tls, [string]$Issuer, [string]$Subject)
     if ($Tls -notmatch '^<I>(.*?)<S>(.*)$') { return $false }
@@ -663,7 +670,9 @@ function Test-FrontendConnector {
 }
 
 # Builds the list of connector changes for the validated certificate.
-# Action: 'update' = pinned to the old certificate, 'pin' = frontend connector without a pinned certificate, 'none' = no change.
+# Action: 'update' = pinned to the old certificate, 'pin' = frontend connector without a pinned certificate,
+# 'align' = hybrid configuration pinned to a different certificate than the hybrid send connector, 'none' = no change.
+# Target = the TlsCertificateName to set (empty = the new certificate).
 function Get-ConnectorPlan {
     Assert-Exchange; Assert-Validated
     $servers = Get-SelectedServers
@@ -674,6 +683,8 @@ function Get-ConnectorPlan {
     $pinFrontend = [bool]$script:ui.PinFrontendCheck.IsChecked
     $pinClient = [bool]$script:ui.PinClientCheck.IsChecked
     $rows = New-Object System.Collections.Generic.List[object]
+    $tlsNew = "<I>$($new.Issuer)<S>$($new.Subject)"
+    $hybridSend = $null; $hybridSendAfter = $null
 
     $classify = {
         param([string]$Tls)
@@ -688,7 +699,12 @@ function Get-ConnectorPlan {
             if (-not $tls) { continue }
             $a = & $classify $tls
             $rows.Add([pscustomobject]@{ Action = $a[0]; Type = 'Send'; Server = (@($c.SourceTransportServers | ForEach-Object { "$_" }) -join ','); Connector = "$($c.Identity)"
-                    Ports = ''; Fqdn = "$($c.Fqdn)"; Current = $tls; Note = $a[1] })
+                    Ports = ''; Fqdn = "$($c.Fqdn)"; Current = $tls; Note = $a[1]; Target = '' })
+            # The connector the HCW created for mail to Exchange Online, and its value after Step C
+            if (-not $hybridSend -and ("$($c.CloudServicesMailEnabled)" -eq 'True' -or "$($c.Identity)" -like 'Outbound to Office 365*')) {
+                $hybridSend = "$($c.Identity)"
+                $hybridSendAfter = if ($a[0] -eq 'update' -or (Test-TlsNameMatches $tls $new.Issuer $new.Subject)) { $tlsNew } else { $tls }
+            }
         }
     }
     catch { Write-Log "Get-SendConnector failed: $($_.Exception.Message)" WARN }
@@ -698,8 +714,19 @@ function Get-ConnectorPlan {
     if ($hc -and "$($hc.TlsCertificateName)") {
         $tls = "$($hc.TlsCertificateName)"
         $a = & $classify $tls
+        $target = ''
+        # The HCW starts from this value: if it differs from the hybrid send connector, a rerun would pin the
+        # connectors back to it. Align it with the send connector's certificate when that one is installed (or new).
+        if ($a[0] -ne 'update' -and $hybridSendAfter -and -not (Test-TlsNameEqual $tls $hybridSendAfter)) {
+            $installed = (Test-TlsNameEqual $hybridSendAfter $tlsNew) -or [bool]@($script:State.Inventory | Where-Object { $_.SelfSigned -ne 'True' -and (Test-TlsNameMatches $hybridSendAfter $_.Issuer $_.Subject) })
+            if ($installed) {
+                $a = @('align', "Differs from the hybrid send connector '$hybridSend'. A Hybrid Configuration Wizard rerun starts from this value and would pin the connectors to it - will be set to the send connector's certificate: $hybridSendAfter")
+                $target = $hybridSendAfter
+            }
+            else { $a = @('none', "Differs from the hybrid send connector '$hybridSend', and that connector's certificate is not installed on the selected servers either - check both manually") }
+        }
         $rows.Add([pscustomobject]@{ Action = $a[0]; Type = 'Hybrid'; Server = ''; Connector = 'HybridConfiguration'; Ports = ''; Fqdn = ''; Current = $tls
-                Note = "$($a[1]) (Hybrid Configuration Wizard setting)" })
+                Note = "$($a[1]) (Hybrid Configuration Wizard setting)"; Target = $target })
     }
 
     foreach ($s in $servers) {
@@ -723,7 +750,7 @@ function Get-ConnectorPlan {
             }
             else { continue }
             $rows.Add([pscustomobject]@{ Action = $a[0]; Type = 'Receive'; Server = $s; Connector = "$($c.Identity)"; Ports = ($ports -join ',')
-                    Fqdn = "$($c.Fqdn)"; Current = $(if ($tls) { $tls } else { '(none)' }); Note = $a[1] })
+                    Fqdn = "$($c.Fqdn)"; Current = $(if ($tls) { $tls } else { '(none)' }); Note = $a[1]; Target = '' })
         }
     }
     $rows.ToArray()
@@ -771,33 +798,34 @@ function Invoke-UpdateConnectors {
         if (-not $todo) { throw 'No connector can be changed until the new certificate is enabled for SMTP on the servers (tab 3, Step B).' }
     }
 
-    $list = ($todo | ForEach-Object { "  [$($_.Action)] $($_.Type) $($_.Connector)" }) -join "`n"
-    $msg = "Set TlsCertificateName on these connectors to:`n  $tlsNew`n`n$list`n`nThe previous values are written to the log as rollback commands."
+    $list = ($todo | ForEach-Object { "  [$($_.Action)] $($_.Type) $($_.Connector)$(if ($_.Target -and -not (Test-TlsNameEqual $_.Target $tlsNew)) { "  ->  $($_.Target)" })" }) -join "`n"
+    $msg = "Set TlsCertificateName on these connectors to:`n  $tlsNew`n(rows marked '->' get the value shown instead)`n`n$list`n`nThe previous values are written to the log as rollback commands."
     if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
     if (-not (Confirm-Action $msg 'Update SMTP connectors')) { Write-Log 'Connector update cancelled.' WARN; return }
     try { Save-ChangeSnapshot -Before 'StepC' } catch { Write-Log "Could not save the rollback snapshot: $($_.Exception.Message)" WARN }
 
     $q = { param([string]$s) "'" + ($s -replace "'", "''") + "'" }
     foreach ($r in $todo) {
+        $value = if ($r.Target) { $r.Target } else { $tlsNew }
         $cmd = switch ($r.Type) { 'Send' { 'Set-SendConnector' } 'Hybrid' { 'Set-HybridConfiguration' } default { 'Set-ReceiveConnector' } }
         $idArg = if ($r.Type -eq 'Hybrid') { '' } else { " -Identity $(& $q $r.Connector)" }
         $prev = if ($r.Current -and $r.Current -ne '(none)') { & $q $r.Current } else { '$null' }
         Write-Log "Rollback for $($r.Connector): $cmd$idArg -TlsCertificateName $prev"
         try {
-            Invoke-Step "$cmd$idArg -TlsCertificateName $(& $q $tlsNew)" {
+            Invoke-Step "$cmd$idArg -TlsCertificateName $(& $q $value)" {
                 if ($r.Type -eq 'Send') {
-                    Set-SendConnector -Identity $r.Connector -TlsCertificateName $tlsNew -ErrorAction Stop
+                    Set-SendConnector -Identity $r.Connector -TlsCertificateName $value -ErrorAction Stop
                     $now = "$((Get-SendConnector -Identity $r.Connector).TlsCertificateName)"
                 }
                 elseif ($r.Type -eq 'Hybrid') {
-                    Set-HybridConfiguration -TlsCertificateName $tlsNew -ErrorAction Stop
+                    Set-HybridConfiguration -TlsCertificateName $value -ErrorAction Stop
                     $now = "$((Get-HybridConfiguration).TlsCertificateName)"
                 }
                 else {
-                    Set-ReceiveConnector -Identity $r.Connector -TlsCertificateName $tlsNew -ErrorAction Stop
+                    Set-ReceiveConnector -Identity $r.Connector -TlsCertificateName $value -ErrorAction Stop
                     $now = "$((Get-ReceiveConnector -Identity $r.Connector).TlsCertificateName)"
                 }
-                if (Test-TlsNameMatches $now $new.Issuer $new.Subject) { Write-Log "$($r.Connector): now uses the new certificate." OK }
+                if (Test-TlsNameEqual $now $value) { Write-Log "$($r.Connector): now uses $(if (Test-TlsNameEqual $value $tlsNew) { 'the new certificate' } else { $value })." OK }
                 else { Write-Log "$($r.Connector): TlsCertificateName is '$now' after the change - check it manually." ERROR }
             }
         }

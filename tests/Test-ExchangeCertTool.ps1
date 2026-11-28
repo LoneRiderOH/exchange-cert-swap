@@ -511,6 +511,39 @@ Assert-That 'EXO plan: foreign gateway, IP-only and non-validating connectors le
 $chg2 = @(Get-ExoConnectorPlan -Inbound $inb -Outbound $outb -Names @('smtp.contoso.com') -Subject 'CN=smtp.contoso.com' -OwnNames @('mail.contoso.com'))
 Assert-That 'EXO plan, renamed host: inbound and outbound set to the new CN' ((@($chg2 | Where-Object { $_.Action -eq 'UPDATE' -and $_.New -eq 'smtp.contoso.com' })).Count -eq 2)
 
+# Step C: hybrid configuration that differs from the hybrid send connector is aligned ('align')
+$leTls = "<I>CN=YR2, O=Let's Encrypt, C=US<S>CN=mail.contoso.com"          # a certificate that is not installed
+$newTls = "<I>CN=R12, O=Let's Encrypt, C=US<S>CN=mail.contoso.com"
+Reset-MockOrg; Update-Inventory; Invoke-ValidatePfx
+$Org.Hybrid = $leTls                                                         # send connector is pinned to OLD1 (installed)
+$hy = @(Get-ConnectorPlan | Where-Object Type -eq 'Hybrid')[0]
+Assert-That 'Step C: hybrid on a missing cert, send connector moving to new -> align to the new certificate' ($hy.Action -eq 'align' -and (Test-TlsNameEqual $hy.Target $newTls))
+$Org.Send[0].TlsCertificateName = $newTls                                    # send connector already on the new certificate
+$hy = @(Get-ConnectorPlan | Where-Object Type -eq 'Hybrid')[0]
+Assert-That 'Step C: send connector already on new, hybrid elsewhere -> align (was "none" before)' ($hy.Action -eq 'align' -and (Test-TlsNameEqual $hy.Target $newTls))
+$Org.Send[0].TlsCertificateName = "<I>CN=Gone CA<S>CN=mail.contoso.com"      # neither certificate installed
+$hy = @(Get-ConnectorPlan | Where-Object Type -eq 'Hybrid')[0]
+Assert-That 'Step C: neither certificate installed -> no change, says check manually' ($hy.Action -eq 'none' -and $hy.Note -match 'check both manually')
+$Org.Send[0].TlsCertificateName = $oldTls; $Org.Hybrid = $oldTls
+$hy = @(Get-ConnectorPlan | Where-Object Type -eq 'Hybrid')[0]
+Assert-That 'Step C: hybrid equal to the send connector (old) -> normal update, no align' ($hy.Action -eq 'update' -and -not $hy.Target)
+# live: only the hybrid row needs a change
+$Org.Send[0].TlsCertificateName = $newTls; $Org.Hybrid = $leTls
+$Org.Receive['EX01'][0].TlsCertificateName = $newTls
+$script:ui.PinFrontendCheck.IsChecked = $false
+$script:ui.DryRunCheck.IsChecked = $true; $Calls.Clear(); $mark = (& $logText).Length
+Invoke-UpdateConnectors
+Assert-That 'Step C align (dry run): logs Set-HybridConfiguration with the new name, changes nothing' ((& $logText).Substring($mark) -match "\[DRY RUN\] Set-HybridConfiguration -TlsCertificateName '<I>CN=R12, O=Let''s Encrypt, C=US<S>CN=mail\.contoso\.com'" -and $Calls.Count -eq 0 -and $Org.Hybrid -eq $leTls)
+$script:ui.DryRunCheck.IsChecked = $false; $Calls.Clear(); $mark = (& $logText).Length
+Invoke-UpdateConnectors
+$runLog = (& $logText).Substring($mark)
+Assert-That 'Step C align live: hybrid configuration now equals the send connector, rollback logged' ((Test-TlsNameEqual $Org.Hybrid $newTls) -and @($Calls -like 'Set-HybridConfiguration*').Count -eq 1 -and @($Calls -like 'Set-SendConnector*').Count -eq 0 -and $runLog -match "Rollback for HybridConfiguration: Set-HybridConfiguration -TlsCertificateName '<I>CN=YR2")
+$snapC = Get-ChildItem -LiteralPath $tmp -Filter 'Snapshot_*_before-StepC.json' | Sort-Object LastWriteTime | Select-Object -Last 1
+Invoke-Rollback -Path $snapC.FullName
+Assert-That 'Step C align: rollback restores the previous hybrid value' ($Org.Hybrid -eq $leTls)
+$script:ui.DryRunCheck.IsChecked = $true; $script:ui.PinFrontendCheck.IsChecked = $true
+Reset-MockOrg
+
 # Module discovery and one-click install for ExchangeOnlineManagement (fake module, fake Install-Module)
 $modRoot = Join-Path $tmp 'mods'
 function Get-ModuleSearchRoots { @($modRoot, (Join-Path $tmp 'mods7')) }   # never the real module folders
