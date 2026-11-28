@@ -1,8 +1,7 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Exchange Certificate Swap Tool - guided WPF GUI to replace the IIS/SMTP certificate
-    on Exchange 2016/2019/SE mailbox servers from a PFX file.
+    Exchange Certificate Swap Tool - guided WPF GUI to replace the IIS/SMTP certificate on
+    Exchange 2016/2019/SE mailbox servers, from a PFX file, a CSR or a free ACME certificate.
 
 .DESCRIPTION
     WHERE TO RUN: on any Exchange mailbox server (or a machine with the Exchange Management Tools), in an elevated
@@ -11,28 +10,32 @@
         powershell.exe -STA -ExecutionPolicy Bypass -File .\ExchangeCertTool.ps1
 
     Workflow (one tab per step):
-      1. Servers & inventory  - read-only: lists mailbox servers and every Exchange certificate.
+      1. Servers & inventory  - read-only: lists mailbox servers and every Exchange certificate, marks the
+                                Auth and internal transport certificates. Buttons: renew/copy the Auth
+                                certificate (staged 49 h rotation) and upload it to Entra ID (hybrid).
       1b. Free certificate    - optional: requests a certificate from Let's Encrypt, ZeroSSL, Google
-                                Trust Services, SSL.com or Actalis (HTTP-01 or DNS-01) with the
-                                Posh-ACME module and loads the resulting PFX into tab 2.
-      2. New certificate      - read-only: opens the PFX, checks key/expiry/EKU/chain, checks that
-                                every Exchange URL host name is covered, reports connectors that
-                                pin the old certificate via TlsCertificateName.
-      3. Import & enable      - imports the same PFX into every selected server, enables it for
-                                IIS + SMTP. Keeps the internal transport certificate unless asked.
-                                Step C updates connectors pinned to the old certificate and can pin
-                                the new one on 'Default Frontend' (25) / 'Client Frontend' (587).
-      4. Verify               - checks Exchange's view and the certificate actually served on
-                                HTTPS 443 (and SMTP 25 STARTTLS, informational).
-      5. Remove old           - optional; refuses to remove certificates still in use
-                                (Auth, internal transport, IIS, pinned by connectors, or unverified server).
+                                Trust Services, SSL.com or Actalis with the Posh-ACME module (HTTP-01,
+                                DNS-01 manual, Cloudflare or a DNS plugin) and loads the PFX into tab 2.
+                                Also creates and tests the scheduled renewal task.
+      2. New certificate      - read-only: opens the PFX, checks key/expiry/EKU/chain, checks that every
+                                Exchange URL host name is covered, reports connectors that pin the old
+                                certificate, and runs the mail flow checks (hybrid name, MX, DANE).
+                                Alternatives: last ACME certificate, an installed certificate, or a CSR.
+      3. Import & enable      - Step A imports the same PFX on every selected server. Step B enables it
+                                for IIS + SMTP (optionally POP/IMAP) and keeps the internal transport
+                                certificate unless asked. Step C updates connectors and the hybrid
+                                configuration. Step D (hybrid) checks the Exchange Online connectors.
+                                Also: rollback from snapshot, Edge Transport and HAProxy packages.
+      4. Verify               - checks Exchange's view and the certificate actually served on HTTPS 443,
+                                SMTP 25 STARTTLS, POP/IMAP and extra endpoints. Rolling restart.
+      5. Remove old           - optional; refuses to remove certificates still in use (Auth, internal
+                                transport, IIS, connectors, hybrid configuration, or unverified server).
 
     "Dry run" is ON by default: every command is written to the log and nothing is changed.
-    Every action is logged to .\logs\CertSwap_<timestamp>.log.
+    Every action is logged to .\logs\CertSwap_<timestamp>.log (CertRenew_<timestamp>.log for -Renew).
+    Secrets (PFX passwords, API tokens, task passwords) are never logged.
 
-    Also: Auth (OAuth) certificate check/renewal (tab 1), CSR for commercial/internal CAs (tab 2),
-    POP/IMAP, rollback snapshots and an Edge Transport package (tab 3), rolling restart (tab 4),
-    and unattended ACME renewal for a scheduled task (-Renew).
+    Without the GUI, -Renew renews a free ACME certificate unattended, for a scheduled task.
 
 .PARAMETER LogDirectory
     Folder for log files. Default: <script folder>\logs
@@ -44,7 +47,8 @@
 .PARAMETER Renew
     Unattended renewal (scheduled task): when the current IIS certificate has fewer than -RenewDays left,
     requests a new ACME certificate with the settings saved by the last successful request in the GUI
-    (same Windows user), validates it and runs Step A, B, C and Verify. Dry run unless -Live is given.
+    (same Windows user), validates it and runs Step A, B, C and Verify. Stops before changing Exchange if
+    a name or a mail flow check fails. Dry run unless -Live is given.
 
 .PARAMETER Live
     With -Renew: make the changes (without it, -Renew only logs what it would do).
@@ -56,17 +60,38 @@
     With -Renew: renew when the current certificate has fewer days left than this. Default 30.
 
 .PARAMETER ForceRenew
-    With -Renew: renew now, regardless of the days left.
+    With -Renew: request a new certificate now, regardless of the days left. Never reuses the
+    certificate that is already on IIS.
 
 .PARAMETER NotifyTo
-    With -Renew: e-mail address(es) that receive the run's log when a renewal ran or failed.
+    With -Renew: e-mail address(es) that receive the run's log when a renewal ran, failed or was a dry run.
+    Several addresses can be given as a list or as one comma-separated string.
 
 .PARAMETER NotifyFrom
     With -Renew: sender address. Default: ExchangeCertTool@<default accepted domain>.
 
 .PARAMETER SmtpServer
     With -Renew: SMTP server for the report. Default: localhost (the Exchange server itself).
+
+.EXAMPLE
+    powershell.exe -STA -ExecutionPolicy Bypass -File .\ExchangeCertTool.ps1
+
+    Starts the GUI in dry run.
+
+.EXAMPLE
+    powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\ExchangeCertTool.ps1 -Renew
+
+    Dry run of the unattended renewal: logs what it would do and changes nothing.
+
+.EXAMPLE
+    powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\ExchangeCertTool.ps1 -Renew -Live -RemoveOld -NotifyTo admin@contoso.com
+
+    What the scheduled renewal task runs (tab 1b creates it).
+
+.LINK
+    https://github.com/LoneRiderOH/exchange-cert-swap
 #>
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [string]$LogDirectory,
