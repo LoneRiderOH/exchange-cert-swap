@@ -830,7 +830,10 @@ function Add-MailFlowChecks {
         $ok = if (-not $cn) { $true } elseif ($cn.StartsWith('*.')) { $Names -contains $cn } else { Test-HostCovered -HostName $cn -CertNames $Names }
         if (-not $cn) { & $out '  [INFO] Hybrid configuration found, but its certificate subject has no CN.' }
         elseif ($ok) { & $out "  [ OK ] Hybrid: $cn is on the new certificate (Exchange Online checks this name on mail from on-premises)." }
-        else { & $block "Hybrid: the new certificate does not contain $cn. The Exchange Online inbound connector for on-premises mail usually checks this name (TlsSenderCertificateName), so mail from on-premises to Exchange Online would be rejected. Add the name to the certificate, or change the connector in Exchange Online / rerun the Hybrid Configuration Wizard first." }
+        else {
+            $m = "Hybrid: the new certificate does not contain $cn. Exchange Online checks the on-premises certificate by name (inbound connector TlsSenderCertificateName, outbound connector TlsDomain), so hybrid mail flow fails until those names are changed. Run tab 3, Step D (Exchange Online connectors) right after Step C, or rerun the Hybrid Configuration Wizard with 'Update Secure Mail Certificate for connectors'."
+            if ($script:Unattended) { & $block "$m Unattended renewals never change names." } else { $Warnings.Add($m) }
+        }
     }
 
     $ca = @()
@@ -1545,7 +1548,7 @@ function Invoke-AuthCertificate {
     "4. Restart MSExchangeServiceHost and recycle the OWA and ECP app pools on each server`n`n" +
     "Current Auth certificate: $(if ($thumb) { "$thumb ($days days left)" } else { 'none' })"
     if ($notSelected) { $msg += "`n`nWARNING: not selected on tab 1: $($notSelected -join ', '). Every Exchange server needs the Auth certificate - select them all first." }
-    if ($hybrid) { $msg += "`n`nHybrid: rerun the Hybrid Configuration Wizard afterwards, so Exchange Online trusts the new certificate." }
+    if ($hybrid) { $msg += "`n`nHybrid: Exchange Online must get the new certificate right afterwards, or free/busy, MailTips and mailbox moves fail. The tool offers to upload it to the dedicated hybrid app in Entra ID when it is done (or rerun the Hybrid Configuration Wizard)." }
     if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
     if (-not (Confirm-Action $msg 'Renew Auth certificate')) { Write-Log 'Cancelled.' WARN; return }
 
@@ -1592,7 +1595,102 @@ function Invoke-AuthCertificate {
         catch { Write-Log "${s}: restart failed ($($_.Exception.Message)). On the server run: Restart-Service MSExchangeServiceHost; Restart-WebAppPool MSExchangeOWAAppPool; Restart-WebAppPool MSExchangeECPAppPool" WARN }
     }
     Update-Inventory
-    if ($hybrid) { Write-Log 'Hybrid: rerun the Hybrid Configuration Wizard now, so Exchange Online gets the new Auth certificate (OAuth free/busy, eDiscovery and mailbox moves depend on it).' WARN }
+    if ($hybrid) {
+        Write-Log 'Hybrid: Exchange Online needs the new Auth certificate now (OAuth free/busy, MailTips, mailbox moves). Use "Upload Auth certificate to Entra ID" on tab 1, or rerun the Hybrid Configuration Wizard.' WARN
+        if (-not $script:Unattended -and (Confirm-Action 'Upload the new Auth certificate to the dedicated Exchange hybrid app in Entra ID now?' 'Hybrid: upload Auth certificate')) { Invoke-UploadAuthToEntra }
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Auth certificate -> dedicated Exchange hybrid app in Entra ID - tab 1
+# Uses Microsoft's ConfigureExchangeHybridApplication.ps1 (CSS-Exchange), only with a valid Microsoft signature.
+# It asks Y/N questions and refuses to run next to ExchangeOnlineManagement, so it runs in its own console window,
+# in "File" mode with public-only .cer files (no Exchange Management Shell or private key needed there).
+# ---------------------------------------------------------------------------------------------
+$script:HybridAppScriptUrl = 'https://github.com/microsoft/CSS-Exchange/releases/latest/download/ConfigureExchangeHybridApplication.ps1'
+$script:HybridAppScriptPath = Join-Path $env:LOCALAPPDATA 'ExchangeCertTool\ConfigureExchangeHybridApplication.ps1'
+
+function Test-MicrosoftSignature {
+    param([Parameter(Mandatory)][string]$Path)
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    $subject = "$($sig.SignerCertificate.Subject)"
+    [pscustomobject]@{ Ok = ("$($sig.Status)" -eq 'Valid' -and $subject -match '(^|,\s*)O=Microsoft Corporation(\s*,|$)'); Status = "$($sig.Status)"; Signer = $subject }
+}
+
+function Get-HybridAppScript {
+    $path = $script:HybridAppScriptPath
+    $fresh = (Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path).LastWriteTime -gt (Get-Date).AddDays(-7))
+    if (-not $fresh) {
+        New-Item -ItemType Directory -Path (Split-Path $path) -Force | Out-Null
+        $tmp = "$path.download"
+        Write-Log "Downloading $($script:HybridAppScriptUrl)"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $script:HybridAppScriptUrl -OutFile $tmp -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        Move-Item -LiteralPath $tmp -Destination $path -Force
+    }
+    $sig = Test-MicrosoftSignature -Path $path
+    if (-not $sig.Ok) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        throw "ConfigureExchangeHybridApplication.ps1 does not have a valid Microsoft signature (status: $($sig.Status), signer: $($sig.Signer)). It was deleted and NOT run."
+    }
+    Write-Log "ConfigureExchangeHybridApplication.ps1: Microsoft signature valid ($($sig.Signer -replace ',.*$', ''))." OK
+    $path
+}
+
+# Public part of an installed Exchange certificate as DER bytes, from the first server that has it.
+function Get-ExchangeCertPublicBytes {
+    param([Parameter(Mandatory)][string]$Thumbprint, [string[]]$Servers)
+    foreach ($s in $Servers) {
+        $x = ConvertTo-X509 (Get-ExchangeCertSafe -Server $s -Thumbprint $Thumbprint)
+        if ($x) { return , [byte[]]$x.RawData }
+    }
+    $null
+}
+
+function Invoke-UploadAuthToEntra {
+    Assert-Exchange
+    $ac = Get-AuthConfig -ErrorAction Stop
+    $certs = [ordered]@{}
+    if ("$($ac.CurrentCertificateThumbprint)") { $certs['current'] = "$($ac.CurrentCertificateThumbprint)" }
+    if ("$($ac.NextCertificateThumbprint)" -and "$($ac.NextCertificateThumbprint)" -ne "$($ac.CurrentCertificateThumbprint)") { $certs['next'] = "$($ac.NextCertificateThumbprint)" }
+    if (-not $certs.Count) { throw 'Get-AuthConfig shows no Auth certificate. Create one first with "Renew / copy Auth certificate".' }
+    $servers = @(Get-SelectedServers) + @($script:State.Servers.Keys | Where-Object { $_ -notin @(Get-SelectedServers) })
+    # The dedicated hybrid app is in use when the evoSTS auth server has an application identifier.
+    $dedicated = $null
+    try { $dedicated = [bool](@(Get-AuthServer -ErrorAction Stop | Where-Object { "$($_.Name)" -like '*evoSTS*' -and "$($_.ApplicationIdentifier)" })) } catch { }
+    $dir = Join-Path (Split-Path $script:LogFile) ('AuthCertUpload_{0:yyyyMMdd_HHmmss}' -f (Get-Date))
+    $files = [ordered]@{}
+    foreach ($k in $certs.Keys) { $files[$k] = Join-Path $dir ("auth-$k-$($certs[$k]).cer") }
+    $q = { param([string]$s) "'" + ($s -replace "'", "''") + "'" }
+    $cmds = @($files.Values | ForEach-Object { "& $(& $q '<script>') -UpdateCertificate -CertificateMethod File -CertificateInformation $(& $q $_)" })
+    $msg = "Upload the Auth certificate to the dedicated Exchange hybrid app in Entra ID (ExchangeServerApp-<organization GUID>)?`n`n" +
+    "$(($certs.Keys | ForEach-Object { "  $($_): $($certs[$_])" }) -join "`n")`n`n" +
+    "The tool exports the public certificates (no private key) to $dir, downloads Microsoft's ConfigureExchangeHybridApplication.ps1 (runs only with a valid Microsoft signature) and opens it in a new PowerShell window:`n  $($cmds -join "`n  ")`n`n" +
+    'Sign in there with a Global Administrator or Application Administrator and answer its questions. The script also removes expired certificates from the app.'
+    if ($dedicated -eq $false) { $msg += "`n`nNOTE: Get-AuthServer shows no dedicated hybrid app (evoSTS has no ApplicationIdentifier). If your hybrid still uses the shared Exchange Online service principal, rerun the Hybrid Configuration Wizard instead - the script will report that the app does not exist." }
+    elseif ($null -eq $dedicated) { $msg += "`n`nNOTE: Get-AuthServer could not be read, so it is unknown whether the dedicated hybrid app is in use." }
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be exported, downloaded or run)" }
+    if (-not (Confirm-Action $msg 'Upload Auth certificate to Entra ID')) { Write-Log 'Cancelled.' WARN; return }
+    if (Test-DryRun) {
+        foreach ($k in $certs.Keys) { Write-Log "[DRY RUN] export the public $k Auth certificate $($certs[$k]) to $($files[$k])" CMD }
+        Write-Log "[DRY RUN] download and signature-check $($script:HybridAppScriptUrl)" CMD
+        foreach ($c in $cmds) { Write-Log "[DRY RUN] (new PowerShell window) $c" CMD }
+        return
+    }
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    foreach ($k in $certs.Keys) {
+        $bytes = Get-ExchangeCertPublicBytes -Thumbprint $certs[$k] -Servers $servers
+        if (-not $bytes) { throw "The $k Auth certificate $($certs[$k]) was not found on $($servers -join ', ') - nothing was uploaded. Use ""Renew / copy Auth certificate"" first." }
+        [IO.File]::WriteAllBytes($files[$k], $bytes)
+        Write-Log "Exported the public $k Auth certificate to $($files[$k])." OK
+    }
+    $script = Get-HybridAppScript
+    $body = (($files.Values | ForEach-Object { "& $(& $q $script) -UpdateCertificate -CertificateMethod File -CertificateInformation $(& $q $_)" }) -join "`n") +
+    "`nWrite-Host ''; Write-Host 'Finished. Check the output above, then close this window.' -ForegroundColor Cyan"
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($body))
+    Write-Log "Starting a new PowerShell window: $($body -replace "`n", ' ; ')" CMD
+    Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc) | Out-Null
+    Write-Log 'Sign in and answer the questions in the new window. Afterwards test, for example: Test-OAuthConnectivity -Service EWS -TargetUri https://outlook.office365.com/ews/exchange.asmx -Mailbox <on-premises mailbox>' OK
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1706,6 +1804,128 @@ function Complete-CertificateRequest {
     if ($idx -lt 0) { throw "Certificate $($leaf.Thumbprint) is installed on $done but not in the installed list - pick it under ""Or installed""." }
     $script:ui.InstalledCertCombo.SelectedIndex = $idx
     Invoke-UseInstalledCertificate
+}
+
+# ---------------------------------------------------------------------------------------------
+# Step D: Exchange Online hybrid connectors - tab 3 (optional, ExchangeOnlineManagement module)
+# Exchange Online checks the on-premises certificate by NAME only: inbound connector TlsSenderCertificateName,
+# outbound connector TlsDomain. A renewal with the same names needs no change there; this step only fixes names
+# that the new certificate no longer covers. EXO cmdlets get the prefix "Cloud" so they cannot clash with on-premises.
+# ---------------------------------------------------------------------------------------------
+$script:ExoPrefix = 'Cloud'
+
+function Test-ExoConnected { [bool](Get-Command "Get-$($script:ExoPrefix)InboundConnector" -ErrorAction SilentlyContinue) }
+
+function Connect-ExoSession {
+    if (Test-ExoConnected) { return }
+    if ($script:Unattended) { throw 'Exchange Online needs an interactive sign-in - not available in an unattended run.' }
+    if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
+        throw 'The ExchangeOnlineManagement module is not installed. In Windows PowerShell run:  Install-Module ExchangeOnlineManagement -Scope CurrentUser  - then click the button again.'
+    }
+    Write-Log 'Connecting to Exchange Online - sign in with an Exchange administrator of the tenant (read-only until you click Step D with Dry run off).'
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop
+    Connect-ExchangeOnline -Prefix $script:ExoPrefix -ShowBanner:$false -ErrorAction Stop
+    if (-not (Test-ExoConnected)) { throw 'Connected, but the connector cmdlets are not available - the account needs an Exchange administrator role in Exchange Online.' }
+    $script:ExoConnectedByTool = $true
+    Write-Log 'Connected to Exchange Online.' OK
+}
+
+function Invoke-Exo { param([string]$Verb, [string]$Noun, [hashtable]$Params = @{}) & "$Verb-$($script:ExoPrefix)$Noun" @Params -ErrorAction Stop }
+
+# Does a connector name value match the certificate names, the way Exchange Online compares them?
+# Inbound (TlsSenderCertificateName): exact name, or "*.domain" = any certificate name in that domain.
+# Outbound (TlsDomain): host name checked like a TLS client does (a *.domain certificate covers one label).
+function Test-ExoNameCovered {
+    param([string]$Value, [string[]]$Names, [ValidateSet('Inbound', 'Outbound')][string]$Kind)
+    $v = "$Value".Trim().ToLowerInvariant()
+    $n = @($Names | ForEach-Object { "$_".ToLowerInvariant() })
+    if (-not $v) { return $true }
+    if ($n -contains $v) { return $true }
+    if ($v.StartsWith('*.')) { $suffix = $v.Substring(1); return [bool]@($n | Where-Object { $_.EndsWith($suffix) }) }
+    if ($Kind -eq 'Outbound') { return (Test-HostCovered -HostName $v -CertNames $n) }
+    $false
+}
+
+# The value the HCW sets: the subject CN of the certificate (e.g. mail.contoso.com or *.contoso.com).
+function Get-CertTlsDomain {
+    param([string]$Subject, [string[]]$Names)
+    if ("$Subject" -match '(?:^|,\s*)CN=([^,]+)') { return $Matches[1].Trim().ToLowerInvariant() }
+    "$(@($Names)[0])".ToLowerInvariant()
+}
+
+# One row per on-premises connector in Exchange Online. Action: UPDATE / OK / SKIP.
+function Get-ExoConnectorPlan {
+    param([object[]]$Inbound, [object[]]$Outbound, [string[]]$Names, [string]$Subject, [string[]]$OwnNames)
+    $target = Get-CertTlsDomain -Subject $Subject -Names $Names
+    $rows = New-Object System.Collections.Generic.List[object]
+    $own = { param($v, $c) "$($c.ConnectorSource)" -eq 'HybridWizard' -or (Test-ExoNameCovered -Value $v -Names $OwnNames -Kind Outbound) -or (Test-ExoNameCovered -Value $v -Names $OwnNames -Kind Inbound) }
+    foreach ($c in @($Inbound | Where-Object { $_ -and "$($_.ConnectorType)" -eq 'OnPremises' })) {
+        $v = "$($c.TlsSenderCertificateName)"
+        $row = [pscustomobject]@{ Action = 'OK'; Type = 'Inbound'; Connector = "$($c.Identity)"; Setting = 'TlsSenderCertificateName'; Current = $v; New = ''; Note = '' }
+        if (-not $v) { $row.Action = 'SKIP'; $row.Note = 'No certificate name set (identified by IP address) - not affected.' }
+        elseif (Test-ExoNameCovered -Value $v -Names $Names -Kind Inbound) { $row.Note = 'Matches the new certificate - no change needed.' }
+        elseif (-not (& $own $v $c)) { $row.Action = 'SKIP'; $row.Note = 'Not created by the HCW and not one of the Exchange certificates - left alone.' }
+        else { $row.Action = 'UPDATE'; $row.New = $target; $row.Note = 'The new certificate does not have this name - mail from on-premises would be rejected.' }
+        $rows.Add($row)
+    }
+    foreach ($c in @($Outbound | Where-Object { $_ -and "$($_.ConnectorType)" -eq 'OnPremises' })) {
+        $v = "$($c.TlsDomain)"
+        $row = [pscustomobject]@{ Action = 'OK'; Type = 'Outbound'; Connector = "$($c.Identity)"; Setting = 'TlsDomain'; Current = $v; New = ''; Note = '' }
+        if ("$($c.TlsSettings)" -ne 'DomainValidation' -or -not $v) { $row.Action = 'SKIP'; $row.Note = "TlsSettings = $(if ("$($c.TlsSettings)") { $c.TlsSettings } else { 'none' }) - the certificate name is not checked." }
+        elseif (Test-ExoNameCovered -Value $v -Names $Names -Kind Outbound) { $row.Note = 'Covered by the new certificate - no change needed.' }
+        elseif (-not (& $own $v $c)) { $row.Action = 'SKIP'; $row.Note = 'Not created by the HCW and not one of the Exchange certificates - left alone.' }
+        else { $row.Action = 'UPDATE'; $row.New = $target; $row.Note = 'Not covered by the new certificate - mail from Exchange Online to on-premises would fail.' }
+        $rows.Add($row)
+    }
+    $rows.ToArray()   # unrolled on purpose: callers use @(...)
+}
+
+# Names of the CA certificates the selected servers use for SMTP now (to recognise connectors that belong to Exchange).
+function Get-OwnSmtpNames {
+    @($script:State.Inventory | Where-Object { $_.SelfSigned -ne 'True' -and ($_.Services -split '\s*,\s*') -contains 'SMTP' } |
+        ForEach-Object { "$($_.Domains)" -split '\s*,\s*' } | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Get-ExoConnectorPlanLive {
+    Assert-Validated
+    Connect-ExoSession
+    if (-not $script:State.Inventory) { Update-Inventory }
+    $in = @(Invoke-Exo Get InboundConnector); $out = @(Invoke-Exo Get OutboundConnector)
+    $plan = Get-ExoConnectorPlan -Inbound $in -Outbound $out -Names @($script:State.NewNames) -Subject "$($script:State.NewCert.Subject)" -OwnNames (Get-OwnSmtpNames)
+    $script:ui.ExoGrid.ItemsSource = (ConvertTo-DataTable $plan @('Action', 'Type', 'Connector', 'Setting', 'Current', 'New', 'Note')).DefaultView
+    if (-not $plan) { Write-Log 'Exchange Online: no on-premises (hybrid) connectors found.' OK }
+    foreach ($r in $plan) { Write-Log ("Exchange Online {0} connector '{1}': {2} = {3} -> {4}{5}" -f $r.Type, $r.Connector, $r.Setting, $(if ($r.Current) { $r.Current } else { '(empty)' }), $r.Action, $(if ($r.New) { " ($($r.New))" } else { '' })) $(if ($r.Action -eq 'UPDATE') { 'WARN' } else { 'INFO' }) }
+    $plan
+}
+
+function Invoke-UpdateExoConnectors {
+    $plan = @(Get-ExoConnectorPlanLive)
+    $todo = @($plan | Where-Object { $_.Action -eq 'UPDATE' })
+    if (-not $todo) { Write-Log 'Exchange Online: nothing to change - the hybrid connectors match the new certificate.' OK; return }
+    $msg = "Change these Exchange Online connectors?`n`n$(($todo | ForEach-Object { "  $($_.Type) '$($_.Connector)': $($_.Setting) $($_.Current) -> $($_.New)" }) -join "`n")`n`n" +
+    'Do this right after Step C (when Exchange on-premises presents the new certificate): with the new name, Exchange Online no longer accepts the old certificate. The current values are saved to a snapshot; "Roll back from snapshot" restores them.'
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+    if (-not (Confirm-Action $msg 'Step D: Exchange Online connectors')) { Write-Log 'Cancelled.' WARN; return }
+    $snap = [ordered]@{ Version = 2; Created = (Get-Date).ToString('s'); Before = 'StepD'; NewThumbprint = $script:State.NewThumb; Servers = [ordered]@{}; Connectors = @()
+        CloudConnectors = @($plan | Where-Object { $_.Action -ne 'SKIP' } | ForEach-Object { [ordered]@{ Type = $_.Type; Identity = $_.Connector; Setting = $_.Setting; Value = $_.Current } }) }
+    $path = Join-Path (Split-Path $script:LogFile) ('Snapshot_{0:yyyyMMdd_HHmmss}_before-StepD.json' -f (Get-Date))
+    $snap | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
+    Write-Log "Saved the Exchange Online connector settings to $path." OK
+    $q = { param([string]$s) "'" + ($s -replace "'", "''") + "'" }
+    foreach ($r in $todo) {
+        $noun = "$($r.Type)Connector"
+        Write-Log "Rollback: Set-$noun -Identity $(& $q $r.Connector) -$($r.Setting) $(& $q $r.Current)   (Exchange Online)"
+        try {
+            Invoke-Step "Set-$noun -Identity $(& $q $r.Connector) -$($r.Setting) $(& $q $r.New)   (Exchange Online)" {
+                Invoke-Exo Set $noun @{ Identity = $r.Connector; $r.Setting = $r.New }
+                $now = "$((Invoke-Exo Get $noun @{ Identity = $r.Connector }).($r.Setting))"
+                if ($now -eq $r.New) { Write-Log "Exchange Online: $($r.Type) '$($r.Connector)' now has $($r.Setting) = $now." OK }
+                else { Write-Log "Exchange Online: $($r.Type) '$($r.Connector)' shows $($r.Setting) = $now, expected $($r.New)." ERROR }
+            }
+        }
+        catch { Write-Log "Exchange Online: $($r.Type) '$($r.Connector)' FAILED: $($_.Exception.Message)" ERROR }
+    }
+    if (-not (Test-DryRun)) { Write-Log 'Exchange Online connectors updated. Send a test message in both directions (cloud mailbox <-> on-premises mailbox) and check the message trace.' OK }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1824,6 +2044,17 @@ function Get-RollbackPlan {
             & $add $c.Type $null $c.Identity $val "Set-$($c.Type)Connector -Identity $(& $q $c.Identity) -TlsCertificateName $(& $q $val)"
         }
     }
+    if (@($Snapshot.CloudConnectors).Count) {
+        if (-not (Test-ExoConnected)) { Write-Log 'The snapshot contains Exchange Online connectors: click "Check Exchange Online connectors" on tab 3 to sign in, then roll back again to restore them.' WARN }
+        else {
+            foreach ($c in @($Snapshot.CloudConnectors)) {
+                # Exchange Online rows: Server holds the setting name (TlsSenderCertificateName / TlsDomain)
+                try { $cur = "$((Invoke-Exo Get "$($c.Type)Connector" @{ Identity = "$($c.Identity)" }).($c.Setting))" }
+                catch { Write-Log "Exchange Online connector '$($c.Identity)' not found - skipped." WARN; continue }
+                if ($cur -ne "$($c.Value)") { & $add "Exo$($c.Type)" $c.Setting $c.Identity "$($c.Value)" "Set-$($c.Type)Connector -Identity $(& $q $c.Identity) -$($c.Setting) $(& $q "$($c.Value)")   (Exchange Online)" }
+            }
+        }
+    }
     if ($null -ne $Snapshot.Hybrid) {
         $hc = Get-HybridConfigSafe
         if ($hc -and "$($hc.TlsCertificateName)" -ne "$($Snapshot.Hybrid)") {
@@ -1862,6 +2093,8 @@ function Invoke-Rollback {
                     'Send' { Set-SendConnector -Identity $r.Identity -TlsCertificateName $r.Value -ErrorAction Stop }
                     'Receive' { Set-ReceiveConnector -Identity $r.Identity -TlsCertificateName $r.Value -ErrorAction Stop }
                     'Hybrid' { Set-HybridConfiguration -TlsCertificateName $r.Value -ErrorAction Stop }
+                    'ExoInbound' { Invoke-Exo Set InboundConnector @{ Identity = $r.Identity; $r.Server = $r.Value } }
+                    'ExoOutbound' { Invoke-Exo Set OutboundConnector @{ Identity = $r.Identity; $r.Server = $r.Value } }
                 }
                 Write-Log "Restored: $($r.Text)" OK
             }
@@ -3183,8 +3416,10 @@ function Invoke-UnattendedRenewal {
             <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
               <Button x:Name="ReloadServersButton" Content="Reload server list" Margin="0,0,0,6"/>
               <Button x:Name="RefreshButton" Content="Refresh certificate inventory" Margin="0,0,0,6"/>
-              <Button x:Name="AuthRenewButton" Content="Renew / copy Auth certificate..." Margin="0"
+              <Button x:Name="AuthRenewButton" Content="Renew / copy Auth certificate..." Margin="0,0,0,6"
                       ToolTip="Copies the Auth (OAuth) certificate to selected servers that miss it, or - when fewer than 60 days are left - creates a new one and makes it current (Set-AuthConfig)."/>
+              <Button x:Name="AuthUploadButton" Content="Upload Auth certificate to Entra ID..." Margin="0"
+                      ToolTip="Hybrid only: uploads the current (and next) Auth certificate to the dedicated Exchange hybrid app in Entra ID with Microsoft's ConfigureExchangeHybridApplication.ps1, in a new PowerShell window. Needed after the Auth certificate was renewed."/>
             </StackPanel>
             <ListBox x:Name="ServerList" SelectionMode="Multiple"/>
           </DockPanel>
@@ -3331,6 +3566,14 @@ function Invoke-UnattendedRenewal {
             <Button x:Name="ConnectorUpdateButton" Content="Step C: Update connectors"/>
           </StackPanel>
           <DataGrid x:Name="ConnectorGrid" Height="190"/>
+          <TextBlock Margin="0,22,0,4" FontWeight="Bold" Text="Step D: Exchange Online connectors (hybrid, optional)"/>
+          <TextBlock TextWrapping="Wrap" Foreground="DimGray"
+                     Text="Exchange Online checks your certificate by name only (inbound connector TlsSenderCertificateName, outbound connector TlsDomain). With the same names nothing changes there - no Hybrid Configuration Wizard run needed. If the names changed, Step D sets them to the new certificate's name right after Step C. Needs the ExchangeOnlineManagement module and an Exchange administrator sign-in."/>
+          <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
+            <Button x:Name="ExoCheckButton" Content="Check Exchange Online connectors"/>
+            <Button x:Name="ExoUpdateButton" Content="Step D: Update Exchange Online connectors"/>
+          </StackPanel>
+          <DataGrid x:Name="ExoGrid" Height="110"/>
           <TextBlock Margin="0,22,0,4" FontWeight="Bold" Text="Roll back / Edge Transport / HAProxy"/>
           <TextBlock TextWrapping="Wrap" Foreground="DimGray"
                      Text="Steps B and C first save the current configuration to logs\Snapshot_*.json. Roll back restores the IIS certificate (also a self-signed one), internal transport certificate, connector and hybrid TlsCertificateName and POP/IMAP names from a snapshot (the old certificate must still be installed). The Edge and HAProxy packages are folders with the PFX and an install script for Edge Transport servers and for an HAProxy that terminates TLS - this tool cannot reach either."/>
@@ -3394,7 +3637,7 @@ function New-MainWindow {
 }
 
 $script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'LoadAcmeButton', 'UseInstalledButton', 'RefreshInstalledButton', 'ImportButton', 'EnableButton', 'ConnectorPreviewButton', 'ConnectorUpdateButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
-'AuthRenewButton', 'CsrCreateButton', 'CsrCompleteButton', 'RollbackButton', 'EdgePackageButton', 'HaproxyPackageButton', 'RestartButton',
+'AuthRenewButton', 'CsrCreateButton', 'CsrCompleteButton', 'RollbackButton', 'EdgePackageButton', 'HaproxyPackageButton', 'AuthUploadButton', 'ExoCheckButton', 'ExoUpdateButton', 'RestartButton',
 'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeCfTestButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
@@ -3450,6 +3693,10 @@ function Register-UiEvents {
     $ui.LoadOldButton.Add_Click({ Invoke-UiAction 'Load candidates' { Update-OldCandidates } })
     $ui.RemoveButton.Add_Click({ Invoke-UiAction 'Remove' { Invoke-RemoveOld } })
     $ui.AuthRenewButton.Add_Click({ Invoke-UiAction 'Auth certificate' { Invoke-AuthCertificate } })
+    $ui.AuthUploadButton.Add_Click({ Invoke-UiAction 'Upload Auth certificate' { Invoke-UploadAuthToEntra } })
+    $ui.ExoCheckButton.Add_Click({ Invoke-UiAction 'Exchange Online connectors' { [void](Get-ExoConnectorPlanLive) } })
+    $ui.ExoUpdateButton.Add_Click({ Invoke-UiAction 'Step D' { Invoke-UpdateExoConnectors } })
+    $script:Window.Add_Closed({ if ($script:ExoConnectedByTool) { try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop } catch { } } })
     $ui.CsrCreateButton.Add_Click({ Invoke-UiAction 'Create CSR' { New-CertificateRequest } })
     $ui.CsrCompleteButton.Add_Click({ Invoke-UiAction 'Complete pending request' { Complete-CertificateRequest } })
     $ui.RollbackButton.Add_Click({ Invoke-UiAction 'Roll back' { Invoke-Rollback } })

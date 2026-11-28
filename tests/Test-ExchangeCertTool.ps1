@@ -441,6 +441,99 @@ rm -rf certificate.pfx good.pem "$T" bak w
 }
 
 # ---------------------------------------------------------------------------------------------
+# Step D: Exchange Online connectors (name-only checks) - mocked Exchange Online cmdlets with prefix "Cloud"
+# ---------------------------------------------------------------------------------------------
+$wild = @('*.contoso.com', 'contoso.com')
+Assert-That 'EXO names: exact name / wildcard value / host under wildcard certificate' (
+    (Test-ExoNameCovered 'mail.contoso.com' @('mail.contoso.com') Inbound) -and (Test-ExoNameCovered '*.contoso.com' @('mail.contoso.com') Inbound) -and
+    -not (Test-ExoNameCovered 'mail.contoso.com' $wild Inbound) -and (Test-ExoNameCovered 'mail.contoso.com' $wild Outbound) -and
+    -not (Test-ExoNameCovered 'a.b.contoso.com' $wild Outbound) -and -not (Test-ExoNameCovered 'mail.fabrikam.com' @('mail.contoso.com') Outbound))
+$inb = @(
+    [pscustomobject]@{ Identity = 'Inbound from 1111'; ConnectorType = 'OnPremises'; ConnectorSource = 'HybridWizard'; TlsSenderCertificateName = 'mail.contoso.com' }
+    [pscustomobject]@{ Identity = 'Gateway'; ConnectorType = 'OnPremises'; ConnectorSource = 'Default'; TlsSenderCertificateName = 'relay.fabrikam.net' }
+    [pscustomobject]@{ Identity = 'IP only'; ConnectorType = 'OnPremises'; ConnectorSource = 'Default'; TlsSenderCertificateName = $null }
+    [pscustomobject]@{ Identity = 'Partner'; ConnectorType = 'Partner'; ConnectorSource = 'Default'; TlsSenderCertificateName = 'partner.example' })
+$outb = @(
+    [pscustomobject]@{ Identity = 'Outbound to 1111'; ConnectorType = 'OnPremises'; ConnectorSource = 'HybridWizard'; TlsSettings = 'DomainValidation'; TlsDomain = 'mail.contoso.com' }
+    [pscustomobject]@{ Identity = 'No validation'; ConnectorType = 'OnPremises'; ConnectorSource = 'Default'; TlsSettings = 'EncryptionOnly'; TlsDomain = $null })
+$same = @(Get-ExoConnectorPlan -Inbound $inb -Outbound $outb -Names @('mail.contoso.com', 'autodiscover.contoso.com') -Subject 'CN=mail.contoso.com' -OwnNames @('mail.contoso.com'))
+Assert-That 'EXO plan, same names (normal renewal): nothing to update' (@($same | Where-Object Action -eq 'UPDATE').Count -eq 0 -and $same.Count -eq 5)
+$chg = @(Get-ExoConnectorPlan -Inbound $inb -Outbound $outb -Names $wild -Subject 'CN=*.contoso.com' -OwnNames @('mail.contoso.com'))
+$upd = @($chg | Where-Object Action -eq 'UPDATE')
+Assert-That 'EXO plan, mail.* -> wildcard: inbound updated to *.contoso.com, outbound host still covered' ($upd.Count -eq 1 -and $upd[0].Connector -eq 'Inbound from 1111' -and $upd[0].New -eq '*.contoso.com' -and ($chg | Where-Object Connector -eq 'Outbound to 1111').Action -eq 'OK')
+Assert-That 'EXO plan: foreign gateway, IP-only and non-validating connectors left alone' ((@($chg | Where-Object { $_.Connector -in 'Gateway', 'IP only', 'No validation' -and $_.Action -eq 'SKIP' })).Count -eq 3)
+$chg2 = @(Get-ExoConnectorPlan -Inbound $inb -Outbound $outb -Names @('smtp.contoso.com') -Subject 'CN=smtp.contoso.com' -OwnNames @('mail.contoso.com'))
+Assert-That 'EXO plan, renamed host: inbound and outbound set to the new CN' ((@($chg2 | Where-Object { $_.Action -eq 'UPDATE' -and $_.New -eq 'smtp.contoso.com' })).Count -eq 2)
+
+# Step D end to end against mocked Exchange Online
+$global:Cloud = @{ In = @($inb | ForEach-Object { $_.PSObject.Copy() }); Out = @($outb | ForEach-Object { $_.PSObject.Copy() }) }
+function global:Get-CloudInboundConnector { [CmdletBinding()] param($Identity) if ($Identity) { $Cloud.In | Where-Object Identity -eq $Identity } else { $Cloud.In } }
+function global:Get-CloudOutboundConnector { [CmdletBinding()] param($Identity) if ($Identity) { $Cloud.Out | Where-Object Identity -eq $Identity } else { $Cloud.Out } }
+function global:Set-CloudInboundConnector { [CmdletBinding()] param($Identity, $TlsSenderCertificateName) $Calls.Add("EXO Set-InboundConnector $Identity"); ($Cloud.In | Where-Object Identity -eq $Identity).TlsSenderCertificateName = $TlsSenderCertificateName }
+function global:Set-CloudOutboundConnector { [CmdletBinding()] param($Identity, $TlsDomain) $Calls.Add("EXO Set-OutboundConnector $Identity"); ($Cloud.Out | Where-Object Identity -eq $Identity).TlsDomain = $TlsDomain }
+Reset-MockOrg
+Update-Inventory
+Invoke-ValidatePfx
+$script:State.NewNames = $wild; $script:State.NewCert.Subject = 'CN=*.contoso.com'
+$script:ui.DryRunCheck.IsChecked = $true; $Calls.Clear(); $mark = (& $logText).Length
+Invoke-UpdateExoConnectors
+$runLog = (& $logText).Substring($mark)
+Assert-That 'Step D (dry run): logs Set-InboundConnector, changes nothing' ($runLog -match "\[DRY RUN\] Set-InboundConnector -Identity 'Inbound from 1111' -TlsSenderCertificateName '\*\.contoso\.com'" -and $Calls.Count -eq 0 -and $Cloud.In[0].TlsSenderCertificateName -eq 'mail.contoso.com')
+$script:ui.DryRunCheck.IsChecked = $false; $Calls.Clear()
+Invoke-UpdateExoConnectors
+$snapD = Get-ChildItem -LiteralPath $tmp -Filter 'Snapshot_*_before-StepD.json' | Sort-Object LastWriteTime | Select-Object -Last 1
+Assert-That 'Step D live: only the hybrid inbound connector changed, snapshot saved' ($Cloud.In[0].TlsSenderCertificateName -eq '*.contoso.com' -and $Cloud.In[1].TlsSenderCertificateName -eq 'relay.fabrikam.net' -and @($Calls).Count -eq 1 -and [bool]$snapD)
+$planD = @(Get-RollbackPlan -Snapshot (Get-Content -LiteralPath $snapD.FullName -Raw | ConvertFrom-Json))
+Assert-That 'Step D rollback plan: one Exchange Online row' ($planD.Count -eq 1 -and $planD[0].Kind -eq 'ExoInbound' -and $planD[0].Value -eq 'mail.contoso.com')
+Invoke-Rollback -Path $snapD.FullName
+Assert-That 'Step D rollback: Exchange Online inbound connector restored' ($Cloud.In[0].TlsSenderCertificateName -eq 'mail.contoso.com')
+$keepTest = ${function:Test-ExoConnected}; function Test-ExoConnected { $false }
+$mark = (& $logText).Length
+$planNo = @(Get-RollbackPlan -Snapshot (Get-Content -LiteralPath $snapD.FullName -Raw | ConvertFrom-Json))
+Assert-That 'Step D rollback without an Exchange Online session: warns to sign in, no cloud rows' ((& $logText).Substring($mark) -match 'click "Check Exchange Online connectors"' -and @($planNo | Where-Object { $_.Kind -like 'Exo*' }).Count -eq 0)
+Set-Item -Path function:Test-ExoConnected -Value $keepTest
+$script:ui.DryRunCheck.IsChecked = $true
+
+# ---------------------------------------------------------------------------------------------
+# Auth certificate -> Entra ID: public .cer export, Microsoft-signature gate, separate console window
+# ---------------------------------------------------------------------------------------------
+Reset-MockOrg
+$authKey = [System.Security.Cryptography.RSA]::Create(2048)
+$authReq = New-Object System.Security.Cryptography.X509Certificates.CertificateRequest('CN=Microsoft Exchange Server Auth Certificate', $authKey, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+$authPub = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (, $authReq.CreateSelfSigned([DateTimeOffset]::Now, [DateTimeOffset]::Now.AddYears(5)).RawData)
+$authKey.Dispose()
+foreach ($sv in 'EX01', 'EX02') { $a = $Org.Certs[$sv] | Where-Object Thumbprint -eq 'AUTH1'; $a | Add-Member -NotePropertyName RawData -NotePropertyValue $authPub.RawData -Force }
+function global:Get-AuthServer { [CmdletBinding()] param() [pscustomobject]@{ Name = 'EvoSts - 1234'; ApplicationIdentifier = 'aaaa-bbbb' } }
+$script:HybridAppScriptPath = Join-Path $tmp 'hybridapp\ConfigureExchangeHybridApplication.ps1'
+$global:SigStatus = 'Valid'
+function Get-AuthenticodeSignature { param($LiteralPath) [pscustomobject]@{ Status = $global:SigStatus; SignerCertificate = [pscustomobject]@{ Subject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US' } } }
+function Invoke-WebRequest { param($Uri, $OutFile, [switch]$UseBasicParsing, $TimeoutSec) $Calls.Add("download $Uri"); Set-Content -LiteralPath $OutFile -Value '# fake' }
+$global:Started = New-Object System.Collections.Generic.List[object]
+function Start-Process { param($FilePath, $ArgumentList) $Started.Add(@{ File = $FilePath; Args = $ArgumentList }) }
+$script:ui.DryRunCheck.IsChecked = $true; $Calls.Clear(); $mark = (& $logText).Length
+Invoke-UploadAuthToEntra
+$runLog = (& $logText).Substring($mark)
+Assert-That 'Auth upload (dry run): commands logged, nothing exported, downloaded or started' ($runLog -match '\[DRY RUN\] \(new PowerShell window\) .*-UpdateCertificate -CertificateMethod File -CertificateInformation .*auth-current-AUTH1\.cer' -and $Calls.Count -eq 0 -and $Started.Count -eq 0 -and -not (Get-ChildItem -LiteralPath $tmp -Directory -Filter 'AuthCertUpload_*'))
+$script:ui.DryRunCheck.IsChecked = $false
+Invoke-UploadAuthToEntra
+$upDir = Get-ChildItem -LiteralPath $tmp -Directory -Filter 'AuthCertUpload_*' | Select-Object -First 1
+$cer = @(Get-ChildItem -LiteralPath $upDir.FullName -Filter '*.cer')
+$cmd = if ($Started.Count) { [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(@($Started[0].Args)[-1])) } else { '' }
+Assert-That 'Auth upload: public certificate exported (no private key)' ($cer.Count -eq 1 -and (New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (, [IO.File]::ReadAllBytes($cer[0].FullName))).Thumbprint -eq $authPub.Thumbprint -and -not (New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (, [IO.File]::ReadAllBytes($cer[0].FullName))).HasPrivateKey)
+Assert-That 'Auth upload: signed script downloaded and started in a new window (File mode)' ($Started.Count -eq 1 -and @($Started[0].Args) -contains '-NoExit' -and $cmd -match [regex]::Escape($script:HybridAppScriptPath) -and $cmd -match '-UpdateCertificate -CertificateMethod File -CertificateInformation' -and $cmd -match [regex]::Escape($cer[0].FullName))
+$global:SigStatus = 'HashMismatch'; $Started.Clear(); Remove-Item -LiteralPath $script:HybridAppScriptPath -Force
+$e = $null; try { Invoke-UploadAuthToEntra } catch { $e = $_.Exception.Message }
+Assert-That 'Auth upload: script without a valid Microsoft signature is deleted and not run' ($e -match 'does not have a valid Microsoft signature' -and $Started.Count -eq 0 -and -not (Test-Path -LiteralPath $script:HybridAppScriptPath))
+$global:SigStatus = 'Valid'
+function global:Get-AuthConfig { [pscustomobject]@{ CurrentCertificateThumbprint = 'AUTH1'; PreviousCertificateThumbprint = $null; NextCertificateThumbprint = 'AUTH2'; NextCertificateEffectiveDate = (Get-Date).AddDays(2) } }
+$e = $null; try { Invoke-UploadAuthToEntra } catch { $e = $_.Exception.Message }
+Assert-That 'Auth upload: next Auth certificate missing on the servers -> stops, nothing started' ($e -match 'next Auth certificate AUTH2 was not found' -and $Started.Count -eq 0)
+function global:Get-AuthConfig { [pscustomobject]@{ CurrentCertificateThumbprint = $Org.Auth; PreviousCertificateThumbprint = $null; NextCertificateThumbprint = $null; NextCertificateEffectiveDate = $null } }
+Remove-Item function:Start-Process, function:Invoke-WebRequest, function:Get-AuthenticodeSignature
+$script:ui.DryRunCheck.IsChecked = $true
+Reset-MockOrg
+
+# ---------------------------------------------------------------------------------------------
 # -ForceRenew never "renews" to the certificate that is already on IIS
 # ---------------------------------------------------------------------------------------------
 $order = Join-Path $env:POSHACME_HOME 'acme-v02.api.letsencrypt.org\1\mail.contoso.com'
