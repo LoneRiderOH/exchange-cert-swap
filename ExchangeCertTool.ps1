@@ -106,6 +106,8 @@ $script:State = @{
     Inventory    = @()
     AuthThumb    = $null
     AuthConfigRead = $false # Get-AuthConfig answered in the last inventory (Invoke-AuthCertificate needs it)
+    AuthNextThumb  = $null  # staged ("next") Auth certificate and the date Exchange makes it current
+    AuthNextDate   = $null
     PfxPath      = $null
     PfxPassword  = $null    # SecureString
     NewCert      = $null    # X509Certificate2 (leaf)
@@ -495,6 +497,9 @@ function Update-Inventory {
         $script:State.AuthConfigRead = $true
         $script:State.AuthThumb = "$($authConfig.CurrentCertificateThumbprint)"
         $script:State.AuthOtherThumbs = @("$($authConfig.PreviousCertificateThumbprint)", "$($authConfig.NextCertificateThumbprint)" | Where-Object { $_ })
+        $script:State.AuthNextThumb = "$($authConfig.NextCertificateThumbprint)"
+        $script:State.AuthNextDate = $null
+        if ($script:State.AuthNextThumb -and $authConfig.NextCertificateEffectiveDate) { try { $script:State.AuthNextDate = [datetime]$authConfig.NextCertificateEffectiveDate } catch { } }
         Write-Log "Auth (OAuth) certificate: $($script:State.AuthThumb)"
     }
     catch { Write-Log "Get-AuthConfig failed: $($_.Exception.Message)" WARN }
@@ -553,7 +558,16 @@ function Test-AuthCertificate {
         else { Write-Log $msg }
     }
     if ($missing) { Write-Log "The Auth (OAuth) certificate $thumb is missing on $($missing -join ', '): OAuth fails on those servers. $fix" WARN }
-    if ("$($AuthConfig.NextCertificateThumbprint)") { Write-Log ('Next Auth certificate {0} is staged, effective {1}.' -f $AuthConfig.NextCertificateThumbprint, $AuthConfig.NextCertificateEffectiveDate) }
+    $next = "$($script:State.AuthNextThumb)"; $nextDate = $script:State.AuthNextDate
+    if ($next -and $next -ne $thumb) {
+        $nextHave = @($Rows | Where-Object { $_.Thumbprint -eq $next } | ForEach-Object { $_.Server })
+        $nextMissing = @($Servers | Where-Object { $_ -notin $nextHave })
+        if ($nextDate -and $nextDate -lt (Get-Date).AddHours(-13)) {
+            Write-Log ('The next Auth certificate {0} was due on {1:yyyy-MM-dd HH:mm}, but Exchange has not made it current yet. The AuthAdmin servicelet may not run: restart MSExchangeServiceHost on one server, then look for event 2014 (MSExchange AuthAdmin) and in <ExchangeInstallPath>\Logging\AuthAdminLogs.' -f $next, $nextDate) WARN
+        }
+        else { Write-Log ('Next Auth certificate {0} is scheduled: Exchange makes it current by itself on {1}.' -f $next, $(if ($nextDate) { $nextDate.ToString('yyyy-MM-dd HH:mm') } else { '(no date)' })) }
+        if ($nextMissing) { Write-Log "The next Auth certificate $next is missing on $($nextMissing -join ', '): copy it before the switch. $fix" WARN }
+    }
 }
 
 function Get-ExchangeHostNames {
@@ -1538,19 +1552,54 @@ function Invoke-AuthCertificate {
         return
     }
 
+    $hybrid = [bool](Get-HybridConfigSafe)
+    $offerUpload = {
+        param([string]$When)
+        Write-Log "Hybrid: Exchange Online needs the new Auth certificate $When (OAuth free/busy, MailTips, mailbox moves). Use ""Upload Auth certificate to Entra ID"" on tab 1, or rerun the Hybrid Configuration Wizard." WARN
+        if (-not $script:Unattended -and (Confirm-Action "Upload the Auth certificates (current and next) to the dedicated Exchange hybrid app in Entra ID now?" 'Hybrid: upload Auth certificate')) { Invoke-UploadAuthToEntra }
+    }
+
+    # A rotation that is already scheduled: never create a second new certificate.
+    $next = "$($script:State.AuthNextThumb)"; $nextDate = $script:State.AuthNextDate
+    if ($next -and $next -ne $thumb -and $nextDate -and $nextDate -gt (Get-Date)) {
+        Write-Log ('A new Auth certificate {0} is already scheduled: Exchange makes it current by itself on {1:yyyy-MM-dd HH:mm}. No new certificate is created.' -f $next, $nextDate) OK
+        $nextMissing = @($servers | Where-Object { -not (Get-ExchangeCertSafe -Server $_ -Thumbprint $next) })
+        if ($nextMissing) {
+            $msg = "Copy the scheduled Auth certificate $next to: $($nextMissing -join ', ')?`n`nIt must be on every server before $($nextDate.ToString('yyyy-MM-dd HH:mm'))."
+            if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+            if (Confirm-Action $msg 'Copy scheduled Auth certificate') { Copy-InstalledCertificate -Servers $servers -Thumbprint $next -Exportable $true }
+        }
+        if ($hybrid) { & $offerUpload "before $($nextDate.ToString('yyyy-MM-dd HH:mm'))" }
+        return
+    }
+
+    # Microsoft's rotation: stage the new certificate as "next", effective in 49 hours; the AuthAdmin servicelet
+    # (MSExchangeServiceHost, every 12 hours) makes it current on that date. Only when the current one is expired,
+    # missing or about to expire is it replaced immediately.
+    $schedule = [bool]($have -and -not $missing -and $days -ge 3)
+    $effective = (Get-Date).AddHours(49)
     $src = $servers[0]
     $notSelected = @($script:State.Servers.Keys | Where-Object { $_ -notin $servers })
-    $hybrid = [bool](Get-HybridConfigSafe)
-    $msg = "Create a new Auth (OAuth) certificate and make it the current one:`n`n" +
-    "1. New-ExchangeCertificate on $src (self-signed, exportable key)`n" +
-    "2. Copy it to: $($servers -join ', ')`n" +
-    "3. Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate <now>, then -PublishCertificate and -ClearPreviousCertificate`n" +
-    "4. Restart MSExchangeServiceHost and recycle the OWA and ECP app pools on each server`n`n" +
-    "Current Auth certificate: $(if ($thumb) { "$thumb ($days days left)" } else { 'none' })"
+    $current = "Current Auth certificate: $(if ($thumb) { "$thumb ($days days left)" } else { 'none' })$(if ($missing -and $have) { "; missing on $($missing -join ', ')" })"
+    if ($schedule) {
+        $msg = "Schedule a new Auth (OAuth) certificate (Microsoft's rotation procedure):`n`n" +
+        "1. New-ExchangeCertificate on $src (self-signed, exportable key)`n" +
+        "2. Copy it to: $($servers -join ', ')`n" +
+        "3. Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate $($effective.ToString('yyyy-MM-dd HH:mm')) (in 49 hours)`n`n" +
+        "Nothing changes for users now. Exchange makes the new certificate current by itself on that date (event 2014, MSExchange AuthAdmin). $current"
+        if ($hybrid) { $msg += "`n`nHybrid: afterwards the tool offers to upload the current and the new certificate to Entra ID - before the switch, so OAuth keeps working." }
+    }
+    else {
+        $msg = "Create a new Auth (OAuth) certificate and make it the current one NOW (the current one is expired, missing or expires in less than 3 days, so the 49-hour rotation is not possible):`n`n" +
+        "1. New-ExchangeCertificate on $src (self-signed, exportable key)`n" +
+        "2. Copy it to: $($servers -join ', ')`n" +
+        "3. Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate <now>, then -PublishCertificate and -ClearPreviousCertificate`n" +
+        "4. Restart MSExchangeServiceHost and recycle the OWA and ECP app pools on each server`n`n$current"
+        if ($hybrid) { $msg += "`n`nHybrid: OAuth to Exchange Online fails until the new certificate is uploaded - the tool offers to do it right afterwards." }
+    }
     if ($notSelected) { $msg += "`n`nWARNING: not selected on tab 1: $($notSelected -join ', '). Every Exchange server needs the Auth certificate - select them all first." }
-    if ($hybrid) { $msg += "`n`nHybrid: Exchange Online must get the new certificate right afterwards, or free/busy, MailTips and mailbox moves fail. The tool offers to upload it to the dedicated hybrid app in Entra ID when it is done (or rerun the Hybrid Configuration Wizard)." }
     if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
-    if (-not (Confirm-Action $msg 'Renew Auth certificate')) { Write-Log 'Cancelled.' WARN; return }
+    if (-not (Confirm-Action $msg $(if ($schedule) { 'Schedule new Auth certificate' } else { 'Replace Auth certificate now' }))) { Write-Log 'Cancelled.' WARN; return }
 
     $new = Invoke-Step "New-ExchangeCertificate -Server $src -KeySize 2048 -PrivateKeyExportable `$true -SubjectName 'cn=Microsoft Exchange Server Auth Certificate' -FriendlyName 'Microsoft Exchange Server Auth Certificate' -DomainName @() -Services None" {
         New-ExchangeCertificate -Server $src -KeySize 2048 -PrivateKeyExportable $true -SubjectName 'cn=Microsoft Exchange Server Auth Certificate' `
@@ -1558,8 +1607,14 @@ function Invoke-AuthCertificate {
     }
     if (Test-DryRun) {
         Write-Log "[DRY RUN] copy the new certificate to $($servers -join ', ') (Export-ExchangeCertificate / Import-ExchangeCertificate)" CMD
-        Write-Log '[DRY RUN] Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate (Get-Date) -Force; Set-AuthConfig -PublishCertificate; Set-AuthConfig -ClearPreviousCertificate' CMD
-        Write-Log '[DRY RUN] restart MSExchangeServiceHost and recycle MSExchangeOWAAppPool / MSExchangeECPAppPool on each server' CMD
+        if ($schedule) {
+            Write-Log "[DRY RUN] Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate '$($effective.ToString('yyyy-MM-dd HH:mm'))'   (Exchange switches by itself; no publish, no restarts)" CMD
+        }
+        else {
+            Write-Log '[DRY RUN] Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate (Get-Date) -Force; Set-AuthConfig -PublishCertificate; Set-AuthConfig -ClearPreviousCertificate' CMD
+            Write-Log '[DRY RUN] restart MSExchangeServiceHost and recycle MSExchangeOWAAppPool / MSExchangeECPAppPool on each server' CMD
+        }
+        if ($hybrid) { Write-Log '[DRY RUN] then offer: Upload Auth certificate to Entra ID (current + next)' CMD }
         return
     }
     $newThumb = "$(@($new | Where-Object { $_.Thumbprint })[0].Thumbprint)"
@@ -1568,6 +1623,21 @@ function Invoke-AuthCertificate {
     Copy-InstalledCertificate -Servers $servers -Thumbprint $newThumb -Exportable $true
     $missingNew = @($servers | Where-Object { -not (Get-ExchangeCertSafe -Server $_ -Thumbprint $newThumb) })
     if ($missingNew) { throw "The new Auth certificate $newThumb is not on $($missingNew -join ', ') - Set-AuthConfig was NOT changed. Fix the copy (see the log), then use the button again." }
+
+    if ($schedule) {
+        Invoke-Step "Set-AuthConfig -NewCertificateThumbprint $newThumb -NewCertificateEffectiveDate '$($effective.ToString('yyyy-MM-dd HH:mm'))'" {
+            Set-AuthConfig -NewCertificateThumbprint $newThumb -NewCertificateEffectiveDate $effective -Confirm:$false -ErrorAction Stop
+        }
+        $ac = Get-AuthConfig
+        if ("$($ac.NextCertificateThumbprint)" -eq $newThumb -and "$($ac.CurrentCertificateThumbprint)" -eq $thumb) {
+            Write-Log ('Scheduled: {0} becomes the current Auth certificate on {1:yyyy-MM-dd HH:mm}; until then {2} stays current. The AuthAdmin servicelet switches within 12 hours after that time (Application log: MSExchange AuthAdmin, event 2014).' -f $newThumb, $effective, $thumb) OK
+            Write-Log 'After the switch, recycle the OWA and ECP app pools on each server (Restart-WebAppPool MSExchangeOWAAppPool; Restart-WebAppPool MSExchangeECPAppPool). The inventory on tab 1 warns if the switch did not happen.'
+        }
+        else { Write-Log "Get-AuthConfig shows current $($ac.CurrentCertificateThumbprint) / next $($ac.NextCertificateThumbprint), expected current $thumb / next $newThumb - check it manually." ERROR }
+        Update-Inventory
+        if ($hybrid) { & $offerUpload "before $($effective.ToString('yyyy-MM-dd HH:mm'))" }
+        return
+    }
 
     if ($thumb) { Write-Log "Rollback (the old certificate stays installed): Set-AuthConfig -NewCertificateThumbprint $thumb -NewCertificateEffectiveDate (Get-Date) -Force; Set-AuthConfig -PublishCertificate" }
     $force = @{}
@@ -1595,10 +1665,7 @@ function Invoke-AuthCertificate {
         catch { Write-Log "${s}: restart failed ($($_.Exception.Message)). On the server run: Restart-Service MSExchangeServiceHost; Restart-WebAppPool MSExchangeOWAAppPool; Restart-WebAppPool MSExchangeECPAppPool" WARN }
     }
     Update-Inventory
-    if ($hybrid) {
-        Write-Log 'Hybrid: Exchange Online needs the new Auth certificate now (OAuth free/busy, MailTips, mailbox moves). Use "Upload Auth certificate to Entra ID" on tab 1, or rerun the Hybrid Configuration Wizard.' WARN
-        if (-not $script:Unattended -and (Confirm-Action 'Upload the new Auth certificate to the dedicated Exchange hybrid app in Entra ID now?' 'Hybrid: upload Auth certificate')) { Invoke-UploadAuthToEntra }
-    }
+    if ($hybrid) { & $offerUpload 'now' }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -3417,7 +3484,7 @@ function Invoke-UnattendedRenewal {
               <Button x:Name="ReloadServersButton" Content="Reload server list" Margin="0,0,0,6"/>
               <Button x:Name="RefreshButton" Content="Refresh certificate inventory" Margin="0,0,0,6"/>
               <Button x:Name="AuthRenewButton" Content="Renew / copy Auth certificate..." Margin="0,0,0,6"
-                      ToolTip="Copies the Auth (OAuth) certificate to selected servers that miss it, or - when fewer than 60 days are left - creates a new one and makes it current (Set-AuthConfig)."/>
+                      ToolTip="Copies the Auth (OAuth) certificate to selected servers that miss it. When fewer than 60 days are left it creates a new one and schedules it (Exchange makes it current by itself in 49 hours); if it is expired, missing or has less than 3 days left, it replaces it immediately."/>
               <Button x:Name="AuthUploadButton" Content="Upload Auth certificate to Entra ID..." Margin="0"
                       ToolTip="Hybrid only: uploads the current (and next) Auth certificate to the dedicated Exchange hybrid app in Entra ID with Microsoft's ConfigureExchangeHybridApplication.ps1, in a new PowerShell window. Needed after the Auth certificate was renewed."/>
             </StackPanel>

@@ -31,6 +31,8 @@ function Reset-MockOrg {
         Certs      = @{}
         Transport  = @{ EX01 = 'SELF1'; EX02 = 'SELF2' }
         Auth       = 'AUTH1'
+        AuthNext   = $null
+        AuthNextDate = $null
         Send       = @([pscustomobject]@{ Identity = 'Outbound to Office 365'; TlsCertificateName = $oldTls; SourceTransportServers = @('EX01', 'EX02'); Fqdn = 'mail.contoso.com' })
         Receive    = @{}
         Hybrid     = $oldTls
@@ -52,7 +54,7 @@ function Reset-MockOrg {
 Reset-MockOrg
 
 function global:Get-ExchangeServer { 'EX01', 'EX02' | ForEach-Object { [pscustomobject]@{ Name = $_; Fqdn = "$($_.ToLower()).contoso.local"; ServerRole = 'Mailbox'; AdminDisplayVersion = 'Version 15.2 (Build 1544.4)' } } }
-function global:Get-AuthConfig { [pscustomobject]@{ CurrentCertificateThumbprint = $Org.Auth; PreviousCertificateThumbprint = $null; NextCertificateThumbprint = $null; NextCertificateEffectiveDate = $null } }
+function global:Get-AuthConfig { [pscustomobject]@{ CurrentCertificateThumbprint = $Org.Auth; PreviousCertificateThumbprint = $null; NextCertificateThumbprint = $Org.AuthNext; NextCertificateEffectiveDate = $Org.AuthNextDate } }
 function global:Get-TransportService { [CmdletBinding()] param($Identity) [pscustomobject]@{ InternalTransportCertificateThumbprint = $Org.Transport["$Identity"] } }
 function global:Set-TransportService { [CmdletBinding()] param($Identity, $InternalTransportCertificateThumbprint) $Calls.Add("Set-TransportService $Identity"); $Org.Transport["$Identity"] = $InternalTransportCertificateThumbprint }
 function global:Get-ExchangeCertificate {
@@ -75,9 +77,14 @@ function global:Enable-ExchangeCertificate {
     }
 }
 function global:Remove-ExchangeCertificate { [CmdletBinding(SupportsShouldProcess)] param($Server, $Thumbprint) $Calls.Add("Remove-ExchangeCertificate $Server $Thumbprint"); $Org.Certs["$Server"].Remove(($Org.Certs["$Server"] | Where-Object { $_.Thumbprint -eq $Thumbprint })) }
-function global:Export-ExchangeCertificate { [CmdletBinding()] param($Server, $Thumbprint, [switch]$BinaryEncoded, $Password) $Calls.Add("Export-ExchangeCertificate $Server"); [byte[]](1..200) }
+function global:Export-ExchangeCertificate { [CmdletBinding()] param($Server, $Thumbprint, [switch]$BinaryEncoded, $Password) $Calls.Add("Export-ExchangeCertificate $Server"); , [byte[]](1..200) }
 function global:New-ExchangeCertificate { [CmdletBinding()] param() $Calls.Add('New-ExchangeCertificate') }
-function global:Set-AuthConfig { [CmdletBinding(SupportsShouldProcess)] param() $Calls.Add('Set-AuthConfig') }
+function global:Set-AuthConfig {
+    [CmdletBinding(SupportsShouldProcess)] param($NewCertificateThumbprint, $NewCertificateEffectiveDate, [switch]$PublishCertificate, [switch]$ClearPreviousCertificate, [switch]$Force)
+    if ($NewCertificateThumbprint) { $Calls.Add("Set-AuthConfig -NewCertificateThumbprint $NewCertificateThumbprint"); $Org.AuthNext = $NewCertificateThumbprint; $Org.AuthNextDate = $NewCertificateEffectiveDate }
+    if ($PublishCertificate) { $Calls.Add('Set-AuthConfig -PublishCertificate'); $Org.Auth = $Org.AuthNext; $Org.AuthNext = $null; $Org.AuthNextDate = $null }
+    if ($ClearPreviousCertificate) { $Calls.Add('Set-AuthConfig -ClearPreviousCertificate') }
+}
 function global:Get-SendConnector { [CmdletBinding()] param($Identity) if ($Identity) { $Org.Send | Where-Object { $_.Identity -eq "$Identity" } } else { $Org.Send } }
 function global:Set-SendConnector { [CmdletBinding()] param($Identity, $TlsCertificateName) $Calls.Add("Set-SendConnector $Identity"); ($Org.Send | Where-Object { $_.Identity -eq "$Identity" }).TlsCertificateName = $TlsCertificateName }
 function global:Get-ReceiveConnector {
@@ -181,6 +188,45 @@ try { Invoke-AuthCertificate } catch { $e = $_.Exception.Message }
 Assert-That 'Auth: Get-AuthConfig failure stops the button, nothing created' ($e -match 'Get-AuthConfig did not answer' -and @($Calls -like 'New-ExchangeCertificate*').Count -eq 0 -and @($Calls -like 'Set-AuthConfig*').Count -eq 0)
 Set-Item -Path function:global:Get-AuthConfig -Value $realAuthConfig
 $script:ui.DryRunCheck.IsChecked = $true
+
+# Rotation: a still-valid Auth certificate is staged as "next" for 49 hours (Microsoft's procedure), not switched now
+Reset-MockOrg
+foreach ($sv in 'EX01', 'EX02') { ($Org.Certs[$sv] | Where-Object Thumbprint -eq 'AUTH1').NotAfter = (Get-Date).AddDays(30) }
+Update-Inventory
+$mark = (& $logText).Length; $Calls.Clear()
+Invoke-AuthCertificate
+$runLog = (& $logText).Substring($mark)
+Assert-That 'Auth rotation (dry run): valid certificate -> scheduled 49 h ahead, no publish' ($runLog -match "\[DRY RUN\] Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate '[0-9-]+ [0-9:]+'.*switches by itself" -and $runLog -notmatch 'PublishCertificate' -and $Calls.Count -eq 0)
+foreach ($sv in 'EX01', 'EX02') { ($Org.Certs[$sv] | Where-Object Thumbprint -eq 'AUTH1').NotAfter = (Get-Date).AddDays(1) }
+Update-Inventory
+$mark = (& $logText).Length
+Invoke-AuthCertificate
+Assert-That 'Auth rotation (dry run): under 3 days left -> replaced immediately (publish + clear)' ((& $logText).Substring($mark) -match '\[DRY RUN\] Set-AuthConfig -NewCertificateThumbprint <new> -NewCertificateEffectiveDate \(Get-Date\) -Force; Set-AuthConfig -PublishCertificate')
+
+# live: create, copy, stage; no publish, no restarts, current stays AUTH1
+foreach ($sv in 'EX01', 'EX02') { ($Org.Certs[$sv] | Where-Object Thumbprint -eq 'AUTH1').NotAfter = (Get-Date).AddDays(30) }
+$realNew = ${function:global:New-ExchangeCertificate}; $realImp = ${function:global:Import-ExchangeCertificate}
+function global:New-ExchangeCertificate { [CmdletBinding()] param($Server, $KeySize, $PrivateKeyExportable, $SubjectName, $FriendlyName, $DomainName, $Services)
+    $Calls.Add("New-ExchangeCertificate $Server"); $c = New-MockCert 'AUTH2' 'CN=Microsoft Exchange Server Auth Certificate' 'CN=Microsoft Exchange Server Auth Certificate' 'None' 1825 $true; [void]$Org.Certs["$Server"].Add($c); $c }
+function global:Import-ExchangeCertificate { [CmdletBinding()] param($Server, $FileData, $Password, $PrivateKeyExportable)
+    $Calls.Add("Import-ExchangeCertificate $Server"); $c = (@($Org.Certs.Values | ForEach-Object { $_ }) | Where-Object Thumbprint -eq 'AUTH2' | Select-Object -First 1).PSObject.Copy(); [void]$Org.Certs["$Server"].Add($c); $c }
+Update-Inventory
+$script:ui.DryRunCheck.IsChecked = $false; $Calls.Clear(); $mark = (& $logText).Length
+Invoke-AuthCertificate
+$runLog = (& $logText).Substring($mark)
+$hrs = if ($Org.AuthNextDate) { ([datetime]$Org.AuthNextDate - (Get-Date)).TotalHours } else { 0 }
+Assert-That 'Auth rotation live: AUTH2 on both servers, staged as next ~49 h ahead, AUTH1 still current' ($Org.Auth -eq 'AUTH1' -and $Org.AuthNext -eq 'AUTH2' -and $hrs -gt 48.5 -and $hrs -lt 49.1 -and @($Org.Certs['EX01'] | Where-Object Thumbprint -eq 'AUTH2').Count -eq 1 -and @($Org.Certs['EX02'] | Where-Object Thumbprint -eq 'AUTH2').Count -eq 1)
+Assert-That 'Auth rotation live: no publish, no clear, no restarts' (@($Calls -like 'Set-AuthConfig -Publish*').Count -eq 0 -and @($Calls -like 'Set-AuthConfig -Clear*').Count -eq 0 -and $runLog -notmatch 'MSExchangeServiceHost restarted' -and $runLog -match 'Scheduled: AUTH2 becomes the current Auth certificate')
+Assert-That 'Auth rotation live (hybrid): asks for the upload before the switch' ($runLog -match 'Exchange Online needs the new Auth certificate before ')
+$Calls.Clear(); $mark = (& $logText).Length
+Invoke-AuthCertificate
+Assert-That 'Auth rotation: already scheduled -> no second certificate' ((& $logText).Substring($mark) -match 'is already scheduled' -and @($Calls -like 'New-ExchangeCertificate*').Count -eq 0)
+$Org.AuthNextDate = (Get-Date).AddDays(-2); $mark = (& $logText).Length
+Update-Inventory
+Assert-That 'inventory: overdue scheduled Auth certificate is reported' ((& $logText).Substring($mark) -match 'was due on .* but Exchange has not made it current yet')
+Set-Item -Path function:global:New-ExchangeCertificate -Value $realNew; Set-Item -Path function:global:Import-ExchangeCertificate -Value $realImp
+$script:ui.DryRunCheck.IsChecked = $true
+Reset-MockOrg
 Reset-MockOrg
 Update-Inventory
 
@@ -528,7 +574,7 @@ $global:SigStatus = 'Valid'
 function global:Get-AuthConfig { [pscustomobject]@{ CurrentCertificateThumbprint = 'AUTH1'; PreviousCertificateThumbprint = $null; NextCertificateThumbprint = 'AUTH2'; NextCertificateEffectiveDate = (Get-Date).AddDays(2) } }
 $e = $null; try { Invoke-UploadAuthToEntra } catch { $e = $_.Exception.Message }
 Assert-That 'Auth upload: next Auth certificate missing on the servers -> stops, nothing started' ($e -match 'next Auth certificate AUTH2 was not found' -and $Started.Count -eq 0)
-function global:Get-AuthConfig { [pscustomobject]@{ CurrentCertificateThumbprint = $Org.Auth; PreviousCertificateThumbprint = $null; NextCertificateThumbprint = $null; NextCertificateEffectiveDate = $null } }
+function global:Get-AuthConfig { [pscustomobject]@{ CurrentCertificateThumbprint = $Org.Auth; PreviousCertificateThumbprint = $null; NextCertificateThumbprint = $Org.AuthNext; NextCertificateEffectiveDate = $Org.AuthNextDate } }
 Remove-Item function:Start-Process, function:Invoke-WebRequest, function:Get-AuthenticodeSignature
 $script:ui.DryRunCheck.IsChecked = $true
 Reset-MockOrg
