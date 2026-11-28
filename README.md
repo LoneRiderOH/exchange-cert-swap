@@ -25,6 +25,7 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 - **Enable for IIS and SMTP** (and optionally **POP3/IMAP4**): if `Enable-ExchangeCertificate -Force` replaces the **internal transport certificate**, the tool restores the previous one unless you choose otherwise.
 - **Rollback snapshots**: Steps B and C save the current configuration first, and one button restores it. See [Rollback](#rollback).
 - **Edge Transport**: creates a folder with the PFX and an install script for Edge servers. See [Edge Transport servers](#edge-transport-servers).
+- **HAProxy**: creates a folder with the PFX and a bash script that installs it on an HAProxy that terminates TLS, with a backup, `haproxy -c` and automatic restore. See [HAProxy](#haproxy-tls-termination).
 - **Verification on the network**: opens a real TLS connection to each server on port 443 and compares the served thumbprint with the new certificate. It also checks SMTP port 25 with STARTTLS (for information only), POP3 (995) and IMAP4 (993) when the certificate is enabled for them, and any extra endpoints you list, such as a load balancer or public name. An extra endpoint that serves a different certificate is a **FAIL**: with Extended Protection, which is on by default since Exchange 2019 CU14, Windows authentication through it breaks.
 - **Rolling restart**: `iisreset /noforce` and a Frontend Transport restart, one server at a time, waiting until each server answers on 443 again.
 - **Automatic renewal**: `-Renew` renews a free certificate from a scheduled task and installs it on all servers. See [Automatic renewal](#automatic-renewal--renew).
@@ -39,7 +40,7 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 - **Full log**: each run writes `logs\CertSwap_<timestamp>.log` next to the script (`CertRenew_<timestamp>.log` for `-Renew`). PFX passwords are never logged.
 - **No private key goes into a key store on the machine that runs the tool**: the PFX is opened with `EphemeralKeySet`, so its key stays in memory. It never goes into a Windows key store or onto a smart card or hardware token. The key is installed only on the Exchange servers, through `Import-ExchangeCertificate`. Two features do keep the key **in files**:
   - **Free certificates**: Posh-ACME saves the issued certificate and its key in `%LOCALAPPDATA%\Posh-ACME`.
-  - **The Edge package**: it puts a copy of the PFX in `logs\EdgePackage_*`.
+  - **The Edge and HAProxy packages**: they put a copy of the PFX in `logs\EdgePackage_*` and `logs\HaproxyPackage_*`.
 
   Protect or delete those folders.
 
@@ -98,7 +99,11 @@ For a certificate from DigiCert, Sectigo, GlobalSign and so on, or from your own
 1. Enter the names in the names list on **tab 1b** (the first one becomes the subject CN). Unlike ACME, internal names are allowed here, for internal CAs.
 2. Click **Create CSR (names from tab 1b)...** and choose where to save the `.req` file. The key pair is created on the **first selected server**, with an exportable private key, so Step A can copy the issued certificate to the other servers later.
 3. Submit the `.req` to your CA. For AD CS, the log shows the `certreq -submit -attrib "CertificateTemplate:WebServer" …` command.
-4. Click **Complete pending request (.cer / .p7b)...** and pick the issued file (`.cer`, `.crt`, `.p7b` or `.pem`; not a PFX). The tool finds the server whose pending request has the same CN, imports the certificate there, checks that it has its private key, and then uses it like **Use installed certificate**. Continue with tab 3.
+4. Click **Complete pending request (.cer / .p7b)...** and pick the issued file (`.cer`, `.crt`, `.p7b` or `.pem`; not a PFX). The tool finds the pending request with the same **public key** as the issued certificate, imports the certificate on that server only, checks that it has its private key, and then uses it like **Use installed certificate**. If the request was made for the same name on several servers, the others are left alone. The tool refuses to import when:
+   - the certificate was issued for a request whose public key matches none of the pending requests;
+   - several servers have a request for that name and their keys can't be read. Select only the right server on tab 1.
+
+   If only the name matches and the imported copy turns out to have no private key, the tool removes that copy again. Continue with tab 3.
 
 If the CA sent an intermediate certificate, it must be in the *Intermediate Certification Authorities* store of every server. The chain check on tab 2 shows whether it's missing.
 
@@ -156,7 +161,7 @@ Validation on tab 2 also checks things that break mail flow even though the cert
 
 ## Rollback
 
-Before Step B and before Step C change anything, the tool saves the current configuration to `logs\Snapshot_<timestamp>_before-StepB.json` (or `before-StepC`). The snapshot holds, per server, the IIS certificate, the internal transport certificate and the POP/IMAP `X509CertificateName`, plus the `TlsCertificateName` of all Send connectors, the Receive connectors of the selected servers and the hybrid configuration.
+Before Step B and before Step C change anything, the tool saves the current configuration to `logs\Snapshot_<timestamp>_before-StepB.json` (or `before-StepC`). The snapshot holds, per server, the IIS certificate (including a self-signed one, if the server had no CA certificate yet), the internal transport certificate and the POP/IMAP `X509CertificateName` (an empty value is restored as empty), plus the `TlsCertificateName` of all Send connectors, the Receive connectors of the selected servers and the hybrid configuration.
 
 **Roll back from snapshot...** on tab 3 compares the current configuration with the snapshot you choose, shows the commands that restore it, and runs them after you confirm (Dry run applies). Only values that differ are changed. The new certificate stays installed. IIS can only go back to a certificate that is still installed, so keep the old certificate until you're sure: once tab 5 has removed it, the log says that IIS can't be rolled back on that server.
 
@@ -171,6 +176,28 @@ Edge servers aren't in Active Directory, so the tool can't import the certificat
 ```
 
 The script keeps the internal transport certificate, so the Edge Subscription stays valid and doesn't need to be recreated. The PFX password is not stored in the package. **Delete the folder afterwards**: it contains the private key. The package needs the PFX file, so it isn't available with *Use installed certificate*.
+
+## HAProxy (TLS termination)
+
+You need this only if HAProxy **decrypts** TLS (`bind ... ssl crt ...`). With TCP passthrough, HAProxy needs no certificate.
+
+After you validate a **PFX** on tab 2, **Create HAProxy package...** on tab 3 creates `logs\HaproxyPackage_<timestamp>` with `certificate.pfx` and `install-haproxy-cert.sh`. To use a free certificate, load it with **Load last Let's Encrypt/ACME certificate** on tab 2. Copy the folder to the HAProxy host and run as root:
+
+```bash
+scp -r HaproxyPackage_<timestamp> root@haproxy:/root/
+bash install-haproxy-cert.sh --check                         # convert and verify only
+bash install-haproxy-cert.sh                                 # install to /etc/haproxy/certs/<name>.pem
+bash install-haproxy-cert.sh /etc/haproxy/certs/exchange.pem # or to the file your 'crt' line uses
+```
+
+The script:
+1. converts the PFX with `openssl` **on the HAProxy host**, so the key is never written unencrypted on Windows;
+2. checks the thumbprint and that the key belongs to the certificate;
+3. writes certificate + chain + key with mode `600`;
+4. backs up the previous file to `/root/haproxy-cert-backups` (not into the certificate folder, because HAProxy loads every file in a `crt` folder);
+5. runs `haproxy -c` and reloads HAProxy. If the check fails, it puts the previous file back.
+
+Settings: `HAPROXY_CFG`, `BACKUP_DIR` and `PFXPASS` (asked for if not set). Then add the HAProxy address on tab 4 to check it. **Delete the folder afterwards**, because it contains the private key.
 
 ## Free certificates (ACME)
 
@@ -276,7 +303,7 @@ Without `-Live`, the run is a dry run: it stops before the ACME request (or, if 
 - **Port 443 still serves the old certificate after enabling.** Check the HTTPS binding on *Default Web Site* in IIS Manager. If the binding is correct, click **Rolling restart...** on tab 4 during a quiet period (or run `iisreset /noforce` on each server).
 - **Port 25 still shows the old or self-signed certificate.** Run tab 3, Step C, which pins the new certificate on *Default Frontend*. If tab 4 still shows the old certificate a few minutes after Step C, restart the *Microsoft Exchange Frontend Transport* service during a quiet period.
 - **Internal names such as `.local`**: public CAs can't issue certificates for them. Change the `InternalUrl` values to a public name that is on the certificate, and use split DNS. The tool lists these names during validation.
-- **Load balancers or reverse proxies that terminate TLS** (HAProxy, F5, KEMP, NGINX and so on) need the new certificate installed on them separately. Add their address on tab 4 to check it. With Extended Protection on (the default since Exchange 2019 CU14), they must serve the **same** certificate as Exchange, or Windows authentication through them fails, so tab 4 reports a different certificate as FAIL.
+- **Load balancers or reverse proxies that terminate TLS** (HAProxy, F5, KEMP, NGINX and so on) need the new certificate installed on them separately (for HAProxy, see [HAProxy](#haproxy-tls-termination)). Add their address on tab 4 to check it. With Extended Protection on (the default since Exchange 2019 CU14), they must serve the **same** certificate as Exchange, or Windows authentication through them fails, so tab 4 reports a different certificate as FAIL.
 - **Hybrid deployments**: Step C updates the connectors and the hybrid configuration that point to the old certificate. Rerun the Hybrid Configuration Wizard if your process requires it.
 - **Posh-ACME shows "NOT found" although you installed it**: check the folder list in the log. Common causes are installing it from PowerShell 7 (`pwsh`) as a *different* user than the one running the tool, or a server with no internet access. For offline servers, run `Save-Module Posh-ACME -Path .\Modules` on another machine and copy the `Modules` folder next to `ExchangeCertTool.ps1`. If loading fails because of the execution policy, the log shows the policy that applies.
 - **HTTP-01 fails with 403**: *Require SSL* is set on the root of *Default Web Site*. Use DNS-01, or allow HTTP for `/.well-known/acme-challenge` only.
@@ -284,23 +311,23 @@ Without `-Live`, the run is a dry run: it stops before the ACME request (or, if 
 
 ## Known limitations
 
-- **Rollback** restores only certificates and names that are in the snapshot:
-  - If IIS used a **self-signed** certificate before, IIS can't be rolled back to it.
-  - A POP/IMAP `X509CertificateName` that was **empty** before isn't cleared again.
+- **Rollback** needs the old certificate to be still installed. Snapshots from older versions of the tool don't record self-signed IIS certificates or empty POP/IMAP names, so those aren't restored from them.
 - **POP/IMAP with a wildcard-only certificate**: the name is set to `mail.<domain>`. Check that this name exists in DNS, or set `X509CertificateName` yourself.
-- **CSR created twice for the same name on different servers**: *Complete pending request* can leave a copy without a private key on the server that doesn't own the key. The log reports it as an error; remove that copy by hand.
 - **`-Renew` from a scheduled task** is tested against mock cmdlets only. Before relying on it, do one dry run from the task itself, as the task's user.
+- **HAProxy** is handled through a package that you copy and run yourself; the tool doesn't connect to it. Other load balancers (F5, KEMP, NGINX) need the certificate installed by hand.
 - **Edge Transport, Exchange 2013 and older**: not managed directly (see above).
 
 ## Testing without Exchange
 
-`tests\Test-ExchangeCertTool.ps1` runs the tool against mock Exchange cmdlets (two servers, sample certificates and connectors). It needs no Exchange and no network, and it doesn't create certificates or keys. It covers:
+`tests\Test-ExchangeCertTool.ps1` runs the tool against mock Exchange cmdlets (two servers, sample certificates and connectors). It needs no Exchange and no network, and it doesn't add anything to the Windows certificate stores. Throwaway test keys are kept in memory, or, for the HAProxy script test, in the test's temp folder, which is deleted afterwards. It covers:
 - the inventory and validation of an installed certificate;
 - the mail flow checks;
-- Steps B and C, with snapshots and rollback;
+- Steps B and C, with snapshots and rollback (including a self-signed IIS certificate and empty POP/IMAP names);
+- completing a CSR by public key when the same name was requested on two servers;
 - the Auth certificate, including a failed `Get-AuthConfig`;
 - POP/IMAP restarts;
 - the Edge package;
+- the HAProxy package: the script runs for real with bash and `openssl` against a throwaway PFX (check only, install, backup, failed `haproxy -c`, wrong PFX, `haproxy` missing). It is skipped if Git for Windows isn't installed;
 - unattended renewal, including `-ForceRenew`, which must not reuse the certificate already on IIS. It prints PASS/FAIL per check and exits with 1 if any check fails:
 
 ```powershell

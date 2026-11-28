@@ -273,6 +273,29 @@ function Get-CertSpki {
 
 function ConvertTo-HexString { param([byte[]]$Bytes) [BitConverter]::ToString($Bytes) -replace '-', '' }
 
+# DER SubjectPublicKeyInfo of a PKCS#10 certificate request (base64, PEM text or DER bytes).
+function Get-CsrSpki {
+    param([Parameter(Mandatory)]$Request)
+    [byte[]]$b = if ($Request -is [byte[]]) { $Request } else {
+        [Convert]::FromBase64String((("$Request" -replace '-----[^-]+-----', '') -replace '\s', ''))
+    }
+    $p = (Get-DerElement $b (Get-DerElement $b 0).Content).Content   # into CertificationRequest, then CertificationRequestInfo
+    $p = (Get-DerElement $b $p).End                                   # version
+    $p = (Get-DerElement $b $p).End                                   # subject
+    $spki = Get-DerElement $b $p
+    , [byte[]]$b[$spki.Start..($spki.End - 1)]
+}
+
+# Public key (hex of the SubjectPublicKeyInfo) of an Exchange pending request, or $null when it cannot be read.
+# Windows keeps a placeholder certificate with the request's public key; the request text is the fallback.
+function Get-PendingRequestKey {
+    param($Pending)
+    $x = ConvertTo-X509 $Pending
+    if ($x) { try { return (ConvertTo-HexString (Get-CertSpki $x)) } catch { } }
+    if ("$($Pending.CertificateRequest)") { try { return (ConvertTo-HexString (Get-CsrSpki "$($Pending.CertificateRequest)")) } catch { } }
+    $null
+}
+
 # TLSA data as returned by DNS-over-HTTPS: "3 1 1 ab12..." (Google), "3 1 1 ( AB12... )" (Cloudflare), "\# 35 030101ab..." (RFC 3597).
 function ConvertFrom-TlsaData {
     param([string]$Data)
@@ -1602,13 +1625,17 @@ function New-CertificateRequest {
 
 # Imports the issued certificate on the server that holds the matching pending request, then uses it as the new certificate.
 function Complete-CertificateRequest {
+    param([string]$Path)   # issued certificate file; default: ask with a file dialog
     Assert-Exchange
     $servers = @(Get-SelectedServers)
     if (-not $servers) { throw 'Select at least one server on tab 1.' }
-    $dlg = New-Object Microsoft.Win32.OpenFileDialog
-    $dlg.Filter = 'Issued certificate (*.cer;*.crt;*.p7b;*.pem)|*.cer;*.crt;*.p7b;*.pem|All files (*.*)|*.*'
-    if (-not $dlg.ShowDialog($script:Window)) { return }
-    $bytes = [IO.File]::ReadAllBytes($dlg.FileName)
+    if (-not $Path) {
+        $dlg = New-Object Microsoft.Win32.OpenFileDialog
+        $dlg.Filter = 'Issued certificate (*.cer;*.crt;*.p7b;*.pem)|*.cer;*.crt;*.p7b;*.pem|All files (*.*)|*.*'
+        if (-not $dlg.ShowDialog($script:Window)) { return }
+        $Path = $dlg.FileName
+    }
+    $bytes = [IO.File]::ReadAllBytes($Path)
     $type = [System.Security.Cryptography.X509Certificates.X509Certificate2]::GetCertContentType($bytes)
     # Opening a PFX here could store its private key on this machine - PFX files go through Browse instead.
     if ("$type" -in 'Pfx', 'Pkcs12') { throw 'This is a PFX file (with private key). Use "Browse..." for PFX files.' }
@@ -1618,29 +1645,58 @@ function Complete-CertificateRequest {
     if (-not $leaf) { throw 'No certificate found in the file.' }
     $cn = $leaf.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
     Write-Log "Issued certificate: $($leaf.Subject), issuer $($leaf.Issuer), thumbprint $($leaf.Thumbprint), expires $($leaf.NotAfter.ToString('yyyy-MM-dd'))."
-    $pending = @(foreach ($s in $servers) {
+    # Pair the certificate with its request by PUBLIC KEY: only the server holding that request has the private key.
+    # Matching by name alone can import it on a server without the key (a second CSR for the same name elsewhere).
+    $leafKey = ConvertTo-HexString (Get-CertSpki $leaf)
+    $all = @(foreach ($s in $servers) {
             foreach ($p in @(Get-ExchangeCertificate -Server $s | Where-Object { "$($_.Status)" -eq 'PendingRequest' })) {
                 $pcn = if ("$($p.Subject)" -match '(?:^|,\s*)CN=([^,]+)') { $Matches[1].Trim() } else { '' }
-                if ($pcn -eq $cn) { [pscustomobject]@{ Server = $s; Thumbprint = "$($p.Thumbprint)" } }
+                [pscustomobject]@{ Server = $s; Thumbprint = "$($p.Thumbprint)"; Cn = $pcn; Key = (Get-PendingRequestKey $p) }
             }
         })
-    if (-not $pending) { throw "No pending request for CN=$cn was found on $($servers -join ', '). Select the server where you created the CSR on tab 1." }
-    $msg = "Import $($dlg.FileName)`n  $($leaf.Subject)`n`ninto the pending request on: $(($pending | ForEach-Object { $_.Server } | Select-Object -Unique) -join ', ')"
+    $byKey = @($all | Where-Object { $_.Key -and $_.Key -eq $leafKey })
+    if ($byKey) {
+        $pending = @($byKey | Select-Object -First 1)
+        Write-Log "Matched by public key: the request on $($pending[0].Server) belongs to this certificate." OK
+    }
+    else {
+        $unknown = @($all | Where-Object { -not $_.Key -and $_.Cn -eq $cn })
+        $sameCnKnown = @($all | Where-Object { $_.Key -and $_.Cn -eq $cn })
+        if (-not $unknown) {
+            if ($sameCnKnown) { throw "The pending request(s) for CN=$cn on $(($sameCnKnown | ForEach-Object { $_.Server } | Select-Object -Unique) -join ', ') have a different public key: this certificate was issued for a CSR made elsewhere (another server, or a request that was removed). Nothing was imported." }
+            throw "No pending request for CN=$cn was found on $($servers -join ', '). Select the server where you created the CSR on tab 1."
+        }
+        $srvs = @($unknown | ForEach-Object { $_.Server } | Select-Object -Unique)
+        if ($srvs.Count -gt 1) { throw "Pending requests for CN=$cn exist on $($srvs -join ', ') and their public keys cannot be read, so the tool cannot tell which one this certificate belongs to. Select only the server where you created this CSR on tab 1 (or remove the extra request with Remove-ExchangeCertificate). Nothing was imported." }
+        $pending = @($unknown | Select-Object -First 1)
+        Write-Log "The public key of the pending request on $($srvs[0]) could not be read - matched by name (CN=$cn) only." WARN
+    }
+    $msg = "Import $Path`n  $($leaf.Subject)`n`ninto the pending request on: $($pending[0].Server)"
     if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
     if (-not (Confirm-Action $msg 'Complete pending request')) { Write-Log 'Cancelled.' WARN; return }
     $done = $null
-    foreach ($s in @($pending | ForEach-Object { $_.Server } | Select-Object -Unique)) {
-        try {
-            Invoke-Step "Import-ExchangeCertificate -Server $s -FileData <$($bytes.Length) bytes of $($dlg.FileName)>" {
-                Import-ExchangeCertificate -Server $s -FileData $bytes -ErrorAction Stop | Out-Null
-            }
-            if (Test-DryRun) { continue }
-            $ex = Get-ExchangeCertSafe -Server $s -Thumbprint $leaf.Thumbprint
-            if ($ex -and "$($ex.HasPrivateKey)" -ne 'False') { $done = $s; Write-Log "${s}: request completed - certificate $($leaf.Thumbprint) installed with its private key." OK; break }
-            Write-Log "${s}: the certificate was imported but has no private key here - the CSR was created on another server." ERROR
+    $s = $pending[0].Server
+    $existed = [bool](Get-ExchangeCertSafe -Server $s -Thumbprint $leaf.Thumbprint)
+    try {
+        Invoke-Step "Import-ExchangeCertificate -Server $s -FileData <$($bytes.Length) bytes of $Path>" {
+            Import-ExchangeCertificate -Server $s -FileData $bytes -ErrorAction Stop | Out-Null
         }
-        catch { Write-Log "${s}: import FAILED: $($_.Exception.Message)" WARN }
+        if (-not (Test-DryRun)) {
+            $ex = Get-ExchangeCertSafe -Server $s -Thumbprint $leaf.Thumbprint
+            if ($ex -and "$($ex.HasPrivateKey)" -ne 'False') { $done = $s; Write-Log "${s}: request completed - certificate $($leaf.Thumbprint) installed with its private key." OK }
+            else {
+                Write-Log "${s}: the certificate was imported but has no private key here - it does not belong to this server's request." ERROR
+                if ($ex -and -not $existed) {
+                    # Do not leave a key-less copy behind (it would be offered in the installed list and fail later).
+                    Invoke-Step "Remove-ExchangeCertificate -Server $s -Thumbprint $($leaf.Thumbprint) -Confirm:`$false   # key-less copy" {
+                        Remove-ExchangeCertificate -Server $s -Thumbprint $leaf.Thumbprint -Confirm:$false -ErrorAction Stop
+                    }
+                    Write-Log "${s}: removed the copy without a private key again." OK
+                }
+            }
+        }
     }
+    catch { Write-Log "${s}: import FAILED: $($_.Exception.Message)" ERROR }
     if (Test-DryRun) { return }
     if (-not $done) { throw 'The certificate could not be paired with a pending request (see the log).' }
     Write-Log 'If the CA sent an intermediate certificate, it must be in the Intermediate Certification Authorities store of every server (the chain check in tab 2 shows it).'
@@ -1694,11 +1750,15 @@ function Save-ChangeSnapshot {
     param([string]$Before)
     $servers = @(Get-SelectedServers)
     Update-Inventory
-    $x509Name = { param($cmd, $s) try { "$((& $cmd -Server $s -ErrorAction Stop).X509CertificateName)" } catch { '' } }
+    # $null = could not be read (never restored); '' = was empty (restored as empty, snapshot version 2+)
+    $x509Name = { param($cmd, $s) try { "$((& $cmd -Server $s -ErrorAction Stop).X509CertificateName)" } catch { $null } }
     $srv = [ordered]@{}
     foreach ($s in $servers) {
         $srv[$s] = [ordered]@{
-            Iis               = @($script:State.Inventory | Where-Object { $_.Server -eq $s -and $_.SelfSigned -ne 'True' -and ($_.Services -split ',') -contains 'IIS' } | ForEach-Object { $_.Thumbprint })
+            # Every certificate bound to IIS, CA-issued first - a self-signed one too, so a server that had no
+            # public certificate yet can be rolled back to its self-signed certificate.
+            Iis               = @($script:State.Inventory | Where-Object { $_.Server -eq $s -and ($_.Services -split ',') -contains 'IIS' } |
+                    Sort-Object @{ e = { $_.SelfSigned -eq 'True' } } | ForEach-Object { $_.Thumbprint })
             InternalTransport = "$($script:State.Servers[$s].InternalTransportThumb)"
             Pop               = & $x509Name 'Get-PopSettings' $s
             Imap              = & $x509Name 'Get-ImapSettings' $s
@@ -1713,7 +1773,7 @@ function Save-ChangeSnapshot {
     }
     $hc = Get-HybridConfigSafe
     $snap = [ordered]@{
-        Created = (Get-Date).ToString('s'); Before = $Before; NewThumbprint = $script:State.NewThumb
+        Version = 2; Created = (Get-Date).ToString('s'); Before = $Before; NewThumbprint = $script:State.NewThumb
         Servers = $srv; Connectors = $conns.ToArray(); Hybrid = $(if ($hc) { "$($hc.TlsCertificateName)" } else { $null })
     }
     $path = Join-Path (Split-Path $script:LogFile) ('Snapshot_{0:yyyyMMdd_HHmmss}_before-{1}.json' -f (Get-Date), $Before)
@@ -1727,12 +1787,13 @@ function Get-RollbackPlan {
     $plan = New-Object System.Collections.Generic.List[object]
     $q = { param([string]$s) if ($s) { "'" + ($s -replace "'", "''") + "'" } else { '$null' } }
     $add = { param($Kind, $Server, $Identity, $Value, $Text) $plan.Add([pscustomobject]@{ Kind = $Kind; Server = $Server; Identity = $Identity; Value = $Value; Text = $Text }) }
+    $version = 0; [void][int]::TryParse("$($Snapshot.Version)", [ref]$version)
     foreach ($p in @($Snapshot.Servers.PSObject.Properties)) {
         $s = $p.Name; $v = $p.Value
         $want = @(@($v.Iis) | Where-Object { $_ })[0]
         if ($want) {
             $certs = @(Get-ExchangeCertificate -Server $s)
-            $cur = @($certs | Where-Object { "$($_.IsSelfSigned)" -ne 'True' -and (Get-ServiceList $_) -contains 'IIS' } | ForEach-Object { "$($_.Thumbprint)" })
+            $cur = @($certs | Where-Object { (Get-ServiceList $_) -contains 'IIS' } | ForEach-Object { "$($_.Thumbprint)" })
             if ($cur -notcontains $want) {
                 if ($certs | Where-Object { "$($_.Thumbprint)" -eq $want }) { & $add 'IIS' $s $null $want "Enable-ExchangeCertificate -Server $s -Thumbprint $want -Services IIS -Force" }
                 else { Write-Log "${s}: the snapshot's IIS certificate $want is no longer installed (removed on tab 5?) - IIS cannot be rolled back on this server." ERROR }
@@ -1743,10 +1804,15 @@ function Get-RollbackPlan {
             if ($cur -ne "$($v.InternalTransport)") { & $add 'Transport' $s $null "$($v.InternalTransport)" "Set-TransportService -Identity $s -InternalTransportCertificateThumbprint $($v.InternalTransport)" }
         }
         foreach ($kind in 'Pop', 'Imap') {
-            $want = "$($v.$kind)"
-            if (-not $want) { continue }
-            $cur = "$((& "Get-${kind}Settings" -Server $s).X509CertificateName)"
-            if ($cur -ne $want) { & $add $kind $s $null $want "Set-${kind}Settings -Server $s -X509CertificateName $want" }
+            $raw = $v.$kind
+            if ($null -eq $raw) { continue }                    # not readable when the snapshot was taken
+            $want = "$raw"
+            if (-not $want -and $version -lt 2) { continue }    # version 1 stored '' for "empty" and "not readable"
+            try { $cur = "$((& "Get-${kind}Settings" -Server $s -ErrorAction Stop).X509CertificateName)" }
+            catch { Write-Log "${s}: Get-${kind}Settings failed: $($_.Exception.Message) - $kind not rolled back." WARN; continue }
+            if ($cur -ne $want) {
+                & $add $kind $s $null $(if ($want) { $want } else { $null }) "Set-${kind}Settings -Server $s -X509CertificateName $(& $q $want)"
+            }
         }
     }
     foreach ($c in @($Snapshot.Connectors)) {
@@ -1877,7 +1943,105 @@ function New-EdgePackage {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Free ACME certificates (Let's Encrypt, ZeroSSL, Google, SSL.com, Actalis) via Posh-ACME - tab "1b"
+# HAProxy package - tab 3 (a load balancer that terminates TLS needs the same certificate as Exchange)
+# ---------------------------------------------------------------------------------------------
+# The PFX is converted to HAProxy's PEM format ON the HAProxy host with openssl, so the private key is never
+# written unencrypted on Windows. Written with LF line endings (this .ps1 is stored with CRLF).
+$script:HaproxyScriptTemplate = @'
+#!/usr/bin/env bash
+# Generated by ExchangeCertTool on __DATE__ for certificate __THUMB__
+# (__SUBJECT__).
+#
+# Installs the certificate on an HAProxy host that terminates TLS for Exchange. Run as root in this folder:
+#   bash install-haproxy-cert.sh --check                  # convert and verify only, change nothing
+#   bash install-haproxy-cert.sh                          # install to __TARGET__
+#   bash install-haproxy-cert.sh /etc/haproxy/certs/x.pem # install to another file
+# Environment: HAPROXY_CFG (default /etc/haproxy/haproxy.cfg), BACKUP_DIR (default /root/haproxy-cert-backups),
+#              PFXPASS (PFX password; asked for when not set).
+# The previous file is backed up OUTSIDE the certificate folder (HAProxy loads every file in a 'crt' folder).
+# Delete this folder afterwards: certificate.pfx contains the private key.
+set -euo pipefail
+THUMB='__THUMB__'
+NAME='__NAME__'
+CHECK_ONLY=0
+if [ "${1:-}" = "--check" ]; then CHECK_ONLY=1; shift; fi
+TARGET="${1:-__TARGET__}"
+CFG="${HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}"
+BACKUP_DIR="${BACKUP_DIR:-/root/haproxy-cert-backups}"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PFX="$DIR/certificate.pfx"
+fail() { echo "ERROR: $*" >&2; exit 1; }
+command -v openssl >/dev/null || fail "openssl is not installed."
+[ -f "$PFX" ] || fail "certificate.pfx not found next to this script."
+umask 077
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+if [ -z "${PFXPASS:-}" ]; then read -rsp "PFX password: " PFXPASS; echo; fi
+export PFXPASS
+# OpenSSL 3 needs -legacy for PFX files with older encryption (common for Windows/Posh-ACME exports).
+p12() { openssl pkcs12 -in "$PFX" -passin env:PFXPASS "$@" 2>/dev/null || openssl pkcs12 -legacy -in "$PFX" -passin env:PFXPASS "$@"; }
+p12 -clcerts -nokeys -out "$WORK/leaf.raw" || fail "cannot read certificate.pfx (wrong password?)"
+p12 -cacerts -nokeys -out "$WORK/chain.raw" || true
+p12 -nocerts -nodes -out "$WORK/key.raw" || fail "cannot read the private key from certificate.pfx"
+unset PFXPASS
+pem_certs() { sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' "$1"; }
+pem_certs "$WORK/leaf.raw" > "$WORK/leaf.pem"
+FP="$(openssl x509 -in "$WORK/leaf.pem" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':' | tr 'a-f' 'A-F')"
+[ "$FP" = "$THUMB" ] || fail "certificate.pfx contains $FP, expected $THUMB."
+openssl pkey -in "$WORK/key.raw" -out "$WORK/key.pem" 2>/dev/null || fail "the private key in certificate.pfx cannot be read."
+[ "$(openssl x509 -in "$WORK/leaf.pem" -noout -pubkey | openssl sha256)" = "$(openssl pkey -in "$WORK/key.pem" -pubout | openssl sha256)" ] ||
+    fail "the private key does not belong to the certificate."
+{ cat "$WORK/leaf.pem"; [ -s "$WORK/chain.raw" ] && pem_certs "$WORK/chain.raw"; cat "$WORK/key.pem"; } > "$WORK/haproxy.pem"
+echo "Certificate: $(openssl x509 -in "$WORK/leaf.pem" -noout -subject), $(openssl x509 -in "$WORK/leaf.pem" -noout -enddate)"
+echo "Chain certificates: $(grep -c 'BEGIN CERTIFICATE' "$WORK/haproxy.pem") (including the certificate)"
+if [ "$CHECK_ONLY" = 1 ]; then echo "Check OK - nothing was changed."; exit 0; fi
+[ -f "$CFG" ] || fail "$CFG not found (set HAPROXY_CFG)."
+command -v haproxy >/dev/null || fail "haproxy is not on PATH - run this on the HAProxy host. Nothing was changed."
+if ! grep -qF "$TARGET" "$CFG" && ! grep -qF "$(dirname "$TARGET")" "$CFG"; then
+    echo "WARNING: $CFG does not mention $TARGET or its folder. If HAProxy only passes TLS through (mode tcp), it needs no certificate."
+fi
+mkdir -p "$(dirname "$TARGET")" "$BACKUP_DIR"
+BACKUP=""
+if [ -f "$TARGET" ]; then BACKUP="$BACKUP_DIR/$(basename "$TARGET").$(date +%Y%m%d%H%M%S)"; cp -p "$TARGET" "$BACKUP"; echo "Backup: $BACKUP"; fi
+cp "$WORK/haproxy.pem" "$TARGET.new"
+chmod 600 "$TARGET.new"
+mv -f "$TARGET.new" "$TARGET"
+if ! haproxy -c -f "$CFG"; then
+    echo "HAProxy configuration check FAILED - restoring the previous certificate." >&2
+    if [ -n "$BACKUP" ]; then cp -p "$BACKUP" "$TARGET"; else rm -f "$TARGET"; fi
+    exit 1
+fi
+if command -v systemctl >/dev/null; then systemctl reload haproxy; else service haproxy reload; fi
+echo "Installed $TARGET and reloaded HAProxy."
+echo "Check: echo | openssl s_client -connect 127.0.0.1:443 -servername $NAME 2>/dev/null | openssl x509 -noout -fingerprint -sha1"
+echo "Then run tab 4 of ExchangeCertTool with this HAProxy as an extra endpoint, and delete this folder."
+'@
+
+function New-HaproxyPackage {
+    Assert-Validated
+    if (-not $script:State.PfxPath) { throw 'The HAProxy package needs the PFX file (HAProxy is not an Exchange server, so the certificate cannot be copied from Exchange). Load the PFX on tab 2, e.g. with "Load last Let''s Encrypt/ACME certificate".' }
+    $names = @($script:State.NewNames)
+    $name = @($names | Where-Object { $_ -notmatch '\*' } | Select-Object -First 1)[0]
+    if (-not $name) { $name = (@($names)[0]) -replace '^\*\.', 'mail.' }
+    $target = '/etc/haproxy/certs/{0}.pem' -f (($names | Select-Object -First 1) -replace '^\*\.', 'wildcard.')
+    $dir = Join-Path (Split-Path $script:LogFile) ('HaproxyPackage_{0:yyyyMMdd_HHmmss}' -f (Get-Date))
+    $msg = "Create a folder with a copy of the PFX and an install script for HAProxy?`n`n  $dir`n`n" +
+    "Copy it to the HAProxy host and run: bash install-haproxy-cert.sh --check, then bash install-haproxy-cert.sh (default target $target).`n`n" +
+    'The script converts the PFX with openssl on the HAProxy host, checks the thumbprint and the key, backs up the old file outside the certificate folder, runs haproxy -c and reloads (restores the old file if the check fails). The PFX password is not stored. Only needed if HAProxy terminates TLS (mode http / ssl crt); TCP passthrough needs nothing.'
+    if (-not (Confirm-Action $msg 'HAProxy package')) { Write-Log 'Cancelled.' WARN; return }
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Copy-Item -LiteralPath $script:State.PfxPath -Destination (Join-Path $dir 'certificate.pfx')
+    $subject = ("$($script:State.NewCert.Subject)" -replace '[
+\n]', ' ')
+    $text = $script:HaproxyScriptTemplate.Replace('__DATE__', (Get-Date).ToString('yyyy-MM-dd HH:mm')).Replace('__THUMB__', "$($script:State.NewThumb)".ToUpperInvariant())
+    $text = $text.Replace('__SUBJECT__', $subject).Replace('__NAME__', ($name -replace "'", '')).Replace('__TARGET__', $target)
+    $text = $text -replace "`r`n", "`n"
+    [IO.File]::WriteAllText((Join-Path $dir 'install-haproxy-cert.sh'), $text, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Log "HAProxy package created: $dir (certificate.pfx + install-haproxy-cert.sh). Copy it, e.g.: scp -r `"$dir`" root@<haproxy>:/root/  - then run bash install-haproxy-cert.sh --check on the HAProxy host. It contains the private key - delete it after use." OK
+}
+
+# ---------------------------------------------------------------------------------------------
+# Free ACME certificates (Let's Encrypt, ZeroSSL, Google, SSL.com, Actalis) via Posh-ACME - tab "1b\"
 # ---------------------------------------------------------------------------------------------
 $script:Le = @{
     Mode       = $null      # 'HTTP' | 'DNSManual' | 'DNSPlugin'
@@ -3167,12 +3331,13 @@ function Invoke-UnattendedRenewal {
             <Button x:Name="ConnectorUpdateButton" Content="Step C: Update connectors"/>
           </StackPanel>
           <DataGrid x:Name="ConnectorGrid" Height="190"/>
-          <TextBlock Margin="0,22,0,4" FontWeight="Bold" Text="Roll back / Edge Transport"/>
+          <TextBlock Margin="0,22,0,4" FontWeight="Bold" Text="Roll back / Edge Transport / HAProxy"/>
           <TextBlock TextWrapping="Wrap" Foreground="DimGray"
-                     Text="Steps B and C first save the current configuration to logs\Snapshot_*.json. Roll back restores the IIS certificate, internal transport certificate, connector and hybrid TlsCertificateName and POP/IMAP names from a snapshot (the old certificate must still be installed). The Edge package is a folder with the PFX and a script to run on each Edge Transport server, which this tool cannot reach."/>
+                     Text="Steps B and C first save the current configuration to logs\Snapshot_*.json. Roll back restores the IIS certificate (also a self-signed one), internal transport certificate, connector and hybrid TlsCertificateName and POP/IMAP names from a snapshot (the old certificate must still be installed). The Edge and HAProxy packages are folders with the PFX and an install script for Edge Transport servers and for an HAProxy that terminates TLS - this tool cannot reach either."/>
           <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
             <Button x:Name="RollbackButton" Content="Roll back from snapshot..."/>
             <Button x:Name="EdgePackageButton" Content="Create Edge Transport package..."/>
+            <Button x:Name="HaproxyPackageButton" Content="Create HAProxy package..."/>
           </StackPanel>
         </StackPanel>
         </ScrollViewer>
@@ -3229,7 +3394,7 @@ function New-MainWindow {
 }
 
 $script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'LoadAcmeButton', 'UseInstalledButton', 'RefreshInstalledButton', 'ImportButton', 'EnableButton', 'ConnectorPreviewButton', 'ConnectorUpdateButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
-'AuthRenewButton', 'CsrCreateButton', 'CsrCompleteButton', 'RollbackButton', 'EdgePackageButton', 'RestartButton',
+'AuthRenewButton', 'CsrCreateButton', 'CsrCompleteButton', 'RollbackButton', 'EdgePackageButton', 'HaproxyPackageButton', 'RestartButton',
 'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeCfTestButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
@@ -3289,6 +3454,7 @@ function Register-UiEvents {
     $ui.CsrCompleteButton.Add_Click({ Invoke-UiAction 'Complete pending request' { Complete-CertificateRequest } })
     $ui.RollbackButton.Add_Click({ Invoke-UiAction 'Roll back' { Invoke-Rollback } })
     $ui.EdgePackageButton.Add_Click({ Invoke-UiAction 'Edge package' { New-EdgePackage } })
+    $ui.HaproxyPackageButton.Add_Click({ Invoke-UiAction 'HAProxy package' { New-HaproxyPackage } })
     $ui.RestartButton.Add_Click({ Invoke-UiAction 'Rolling restart' { Invoke-RollingRestart } })
     $ui.LeInstallModuleButton.Add_Click({ Invoke-UiAction 'Install Posh-ACME' { Install-PoshAcme } })
     $ui.LeFillNamesButton.Add_Click({ Invoke-UiAction 'Fill names' { Set-LeNamesFromExchange } })

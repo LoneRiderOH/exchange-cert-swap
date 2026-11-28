@@ -91,8 +91,8 @@ function global:Set-HybridConfiguration { [CmdletBinding()] param($TlsCertificat
 function global:Get-AcceptedDomain { [pscustomobject]@{ DomainName = 'contoso.com'; DomainType = 'Authoritative'; Default = $true }; [pscustomobject]@{ DomainName = 'fabrikam.com'; DomainType = 'Authoritative'; Default = $false } }
 function global:Get-PopSettings { [CmdletBinding()] param($Server) [pscustomobject]@{ X509CertificateName = $Org.Pop["$Server"] } }
 function global:Get-ImapSettings { [CmdletBinding()] param($Server) [pscustomobject]@{ X509CertificateName = $Org.Pop["$Server"] } }
-function global:Set-PopSettings { [CmdletBinding()] param($Server, $X509CertificateName) $Calls.Add("Set-PopSettings $Server") }
-function global:Set-ImapSettings { [CmdletBinding()] param($Server, $X509CertificateName) $Calls.Add("Set-ImapSettings $Server") }
+function global:Set-PopSettings { [CmdletBinding()] param($Server, $X509CertificateName) $Calls.Add("Set-PopSettings $Server"); $Org.Pop["$Server"] = $X509CertificateName }
+function global:Set-ImapSettings { [CmdletBinding()] param($Server, $X509CertificateName) $Calls.Add("Set-ImapSettings $Server"); $Org.Pop["$Server"] = $X509CertificateName }
 function global:Get-ClientAccessService { [CmdletBinding()] param($Identity) [pscustomobject]@{ AutoDiscoverServiceInternalUri = 'https://autodiscover.contoso.com/Autodiscover/Autodiscover.xml' } }
 foreach ($v in 'Owa', 'Ecp', 'WebServices', 'Oab', 'ActiveSync', 'Mapi') {
     Set-Item -Path "function:global:Get-${v}VirtualDirectory" -Value { [CmdletBinding()] param($Server, [switch]$ADPropertiesOnly) [pscustomobject]@{ InternalUrl = 'https://mail.contoso.com/x'; ExternalUrl = 'https://mail.contoso.com/x' } }
@@ -317,6 +317,128 @@ $t = $null; $e = $null
 $edgeText = Get-Content -LiteralPath $edgeScript -Raw
 Assert-That 'Edge package: generated script parses' (-not $e)
 Assert-That "Edge package: thumbprint and escaped TLS name (Let''s Encrypt) inserted" ($edgeText -match "\`$thumb = 'NEW1'" -and $edgeText -match "O=Let''s Encrypt" -and (Test-Path (Join-Path $edgeDir.FullName 'certificate.pfx')))
+
+# ---------------------------------------------------------------------------------------------
+# Rollback: self-signed IIS certificate and empty POP/IMAP names
+# ---------------------------------------------------------------------------------------------
+Reset-MockOrg
+$script:ui.DryRunCheck.IsChecked = $false
+$Org.Certs['EX02'].Remove(($Org.Certs['EX02'] | Where-Object { $_.Thumbprint -eq 'OLD1' }))   # EX02: only its self-signed certificate on IIS
+$Org.Pop['EX02'] = ''
+Save-ChangeSnapshot -Before 'Test'
+$snapT = Get-ChildItem -LiteralPath $tmp -Filter 'Snapshot_*_before-Test.json' | Sort-Object LastWriteTime | Select-Object -Last 1
+$snapObj = Get-Content -LiteralPath $snapT.FullName -Raw | ConvertFrom-Json
+Assert-That 'snapshot v2: self-signed IIS certificate saved, CA certificate first' ($snapObj.Version -eq 2 -and (@($snapObj.Servers.EX02.Iis) -join ',') -eq 'SELF2' -and @($snapObj.Servers.EX01.Iis)[0] -eq 'OLD1')
+# the change: NEW1 takes IIS on EX02, POP/IMAP get a name
+($Org.Certs['EX02'] | Where-Object { $_.Thumbprint -eq 'SELF2' }).Services = 'SMTP'
+$c = $Org.NewCert.PSObject.Copy(); $c.Services = 'IIS, SMTP'; [void]$Org.Certs['EX02'].Add($c)
+$Org.Pop['EX02'] = 'mail.contoso.com'
+$plan = @(Get-RollbackPlan -Snapshot $snapObj)
+Assert-That 'rollback plan: back to the self-signed IIS certificate on EX02' (@($plan | Where-Object { $_.Kind -eq 'IIS' -and $_.Server -eq 'EX02' -and $_.Value -eq 'SELF2' }).Count -eq 1)
+Assert-That 'rollback plan: empty POP and IMAP names restored as $null' (@($plan | Where-Object { $_.Kind -in 'Pop', 'Imap' -and $_.Server -eq 'EX02' -and $null -eq $_.Value -and $_.Text -match 'X509CertificateName \$null$' }).Count -eq 2)
+Assert-That 'rollback plan: EX01 unchanged -> no rows for EX01' (@($plan | Where-Object { $_.Server -eq 'EX01' }).Count -eq 0)
+$v1 = $snapObj | ConvertTo-Json -Depth 6 | ConvertFrom-Json; $v1.PSObject.Properties.Remove('Version')
+Assert-That 'rollback plan: version 1 snapshot ("" = unknown) leaves POP/IMAP alone' (@(Get-RollbackPlan -Snapshot $v1 | Where-Object { $_.Kind -in 'Pop', 'Imap' }).Count -eq 0)
+$v1.Servers.EX02.Pop = $null; $snapObj.Servers.EX02.Pop = $null
+Assert-That 'rollback plan: POP name that could not be read is not restored' (@(Get-RollbackPlan -Snapshot $snapObj | Where-Object { $_.Kind -eq 'Pop' }).Count -eq 0)
+Invoke-Rollback -Path $snapT.FullName
+$iis2 = @($Org.Certs['EX02'] | Where-Object { $_.Services -match 'IIS' } | ForEach-Object { $_.Thumbprint })
+Assert-That 'rollback live: EX02 IIS back on SELF2, POP/IMAP name cleared' ($iis2 -contains 'SELF2' -and @($Calls -like 'Enable-ExchangeCertificate EX02 SELF2 IIS').Count -eq 1 -and [string]::IsNullOrEmpty($Org.Pop['EX02']))
+$script:ui.DryRunCheck.IsChecked = $true
+
+# ---------------------------------------------------------------------------------------------
+# CSR completion pairs the certificate with its request by PUBLIC KEY (keys are in memory only)
+# ---------------------------------------------------------------------------------------------
+Reset-MockOrg
+$newReq = { param($k) New-Object System.Security.Cryptography.X509Certificates.CertificateRequest('CN=mail.contoso.com', $k, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1) }
+$keyA = [System.Security.Cryptography.RSA]::Create(2048); $keyB = [System.Security.Cryptography.RSA]::Create(2048)
+$reqA = & $newReq $keyA; $reqB = & $newReq $keyB
+$csrA = "-----BEGIN NEW CERTIFICATE REQUEST-----`r`n" + [Convert]::ToBase64String($reqA.CreateSigningRequest(), 'InsertLineBreaks') + "`r`n-----END NEW CERTIFICATE REQUEST-----"
+$csrB = [Convert]::ToBase64String($reqB.CreateSigningRequest())
+$issuedA = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (, $reqA.CreateSelfSigned([DateTimeOffset]::Now, [DateTimeOffset]::Now.AddDays(30)).RawData)   # public part only
+$placeB = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (, $reqB.CreateSelfSigned([DateTimeOffset]::Now, [DateTimeOffset]::Now.AddDays(30)).RawData)
+$cerPath = Join-Path $tmp 'issued.cer'; [IO.File]::WriteAllBytes($cerPath, $issuedA.RawData)
+Assert-That 'CSR public key == issued certificate public key (DER parser)' ((ConvertTo-HexString (Get-CsrSpki $csrA)) -eq (ConvertTo-HexString (Get-CertSpki $issuedA)) -and (ConvertTo-HexString (Get-CsrSpki $csrB)) -ne (ConvertTo-HexString (Get-CertSpki $issuedA)))
+function Add-Pending($Server, $Thumb, $Csr, $Raw) {
+    $p = [pscustomobject]@{ Thumbprint = $Thumb; Subject = 'CN=mail.contoso.com'; Status = 'PendingRequest'; Services = 'None'; IsSelfSigned = $false; Issuer = 'CN=mail.contoso.com'; NotAfter = (Get-Date).AddDays(30); CertificateDomains = @('mail.contoso.com'); HasPrivateKey = $true; CertificateRequest = $Csr; RawData = $Raw }
+    [void]$Org.Certs[$Server].Add($p)
+}
+# the same name requested on both servers: EX01 has key B (placeholder certificate), EX02 has key A (request text only)
+Add-Pending 'EX01' 'PENDB' $null $placeB.RawData
+Add-Pending 'EX02' 'PENDA' $csrA $null
+$mark = (& $logText).Length; $Calls.Clear()
+Complete-CertificateRequest -Path $cerPath
+$runLog = (& $logText).Substring($mark)
+Assert-That 'CSR complete (dry run): imported only where the key is (EX02), not EX01' ($runLog -match 'Matched by public key: the request on EX02' -and $runLog -match '\[DRY RUN\] Import-ExchangeCertificate -Server EX02' -and $runLog -notmatch 'Import-ExchangeCertificate -Server EX01' -and $Calls.Count -eq 0)
+$script:ui.ServerList.SelectedItems.Clear(); [void]$script:ui.ServerList.SelectedItems.Add('EX01')
+$e = $null; try { Complete-CertificateRequest -Path $cerPath } catch { $e = $_.Exception.Message }
+Assert-That 'CSR complete: request with another public key is refused, nothing imported' ($e -match 'different public key' -and $Calls.Count -eq 0)
+$script:ui.ServerList.SelectAll()
+Reset-MockOrg
+Add-Pending 'EX01' 'PEND1' $null $null; Add-Pending 'EX02' 'PEND2' $null $null   # keys unreadable on both
+$e = $null; try { Complete-CertificateRequest -Path $cerPath } catch { $e = $_.Exception.Message }
+Assert-That 'CSR complete: two requests with unreadable keys -> asks to select one server' ($e -match 'cannot tell which one' -and $Calls.Count -eq 0)
+# live, name-only match on a server without the key: the key-less copy is removed again
+Reset-MockOrg
+Add-Pending 'EX01' 'PEND1' $null $null
+$realImport = ${function:global:Import-ExchangeCertificate}
+function global:Import-ExchangeCertificate { [CmdletBinding()] param($Server, $FileData) $Calls.Add("Import-ExchangeCertificate $Server"); [void]$Org.Certs["$Server"].Add([pscustomobject]@{ Thumbprint = $issuedA.Thumbprint; Subject = $issuedA.Subject; Status = 'Valid'; Services = 'None'; HasPrivateKey = $false; IsSelfSigned = $false; NotAfter = $issuedA.NotAfter; CertificateDomains = @() }) }
+$script:ui.DryRunCheck.IsChecked = $false
+$e = $null; try { Complete-CertificateRequest -Path $cerPath } catch { $e = $_.Exception.Message }
+Assert-That 'CSR complete live: copy without private key removed, error raised' ($e -match 'could not be paired' -and @($Calls -like "Remove-ExchangeCertificate EX01 $($issuedA.Thumbprint)").Count -eq 1 -and -not ($Org.Certs['EX01'] | Where-Object { $_.Thumbprint -eq $issuedA.Thumbprint }))
+Set-Item -Path function:global:Import-ExchangeCertificate -Value $realImport
+$script:ui.DryRunCheck.IsChecked = $true
+$keyA.Dispose(); $keyB.Dispose()
+Reset-MockOrg
+
+# ---------------------------------------------------------------------------------------------
+# HAProxy package: generated script, then run for real with bash + openssl against a throwaway PFX
+# ---------------------------------------------------------------------------------------------
+New-HaproxyPackage
+$hpDir = Get-ChildItem -LiteralPath $tmp -Directory -Filter 'HaproxyPackage_*' | Select-Object -First 1
+$hpScript = Join-Path $hpDir.FullName 'install-haproxy-cert.sh'
+$hpText = [IO.File]::ReadAllText($hpScript)
+Assert-That 'HAProxy package: PFX + script, LF only, thumbprint and target filled in' ((Test-Path (Join-Path $hpDir.FullName 'certificate.pfx')) -and $hpText -notmatch "`r" -and $hpText -match "THUMB='NEW1'" -and $hpText -match '/etc/haproxy/certs/mail\.contoso\.com\.pem' -and $hpText -notmatch '__[A-Z]+__')
+$bash = @("$env:ProgramFiles\Git\bin\bash.exe", "$env:ProgramFiles\Git\usr\bin\bash.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $bash) { Write-Host 'SKIP HAProxy script run: Git bash not found' -ForegroundColor Yellow }
+else {
+    $hp = ($hpDir.FullName -replace '\\', '/')
+    $runSh = Join-Path $tmp 'hp-run.sh'
+    $runText = @'
+exec 2>&1
+set -u
+D="$1"; cd "$D"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout k.pem -out c.pem -subj /CN=mail.contoso.com -days 2 >/dev/null 2>&1
+openssl pkcs12 -export -inkey k.pem -in c.pem -out certificate.pfx -passout pass:t3st >/dev/null 2>&1
+rm -f k.pem
+FP="$(openssl x509 -in c.pem -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':')"
+# Windows test host only: Git bash maps %TEMP% to /tmp, which Git's native openssl.exe cannot open - use C:/ paths
+mkdir -p w; export TMPDIR="$D/w"
+sed -e "s/^THUMB=.*/THUMB='$FP'/" -e "s#^DIR=.*#DIR='$D'#" install-haproxy-cert.sh > run.sh
+mkdir -p bin certs bak; printf '#!/bin/sh\nexit ${FAKE_HAPROXY_RC:-0}\n' > bin/haproxy; printf '#!/bin/sh\necho reloaded >> "%s/reload.log"\n' "$D" > bin/systemctl; chmod +x bin/*
+echo "    bind :443 ssl crt $D/certs/" > haproxy.cfg
+export PATH="$(cd "$D/bin" && pwd):$PATH" HAPROXY_CFG="$D/haproxy.cfg" BACKUP_DIR="$D/bak" PFXPASS=t3st
+T="$D/certs/mail.pem"
+bash run.sh --check "$T" >/dev/null 2>&1; echo "check=$? installed=$([ -f "$T" ] && echo y || echo n)"
+echo old > "$T"
+bash run.sh "$T" >/dev/null 2>&1; echo "install=$? reload=$(cat reload.log 2>/dev/null | wc -l | tr -d ' ') key=$(grep -c 'PRIVATE KEY-----' "$T") certfp=$(openssl x509 -in "$T" -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':') backups=$(ls bak | wc -l | tr -d ' ') incerts=$(ls certs | wc -l | tr -d ' ')"
+echo "expect=$FP"
+cp "$T" good.pem; echo older > "$T"
+FAKE_HAPROXY_RC=1 bash run.sh "$T" >/dev/null 2>&1; echo "badcfg=$? restored=$(cat "$T")"
+sed -i "s/^THUMB=.*/THUMB='0000'/" run.sh; bash run.sh --check "$T" >/dev/null 2>&1; echo "wrongthumb=$?"
+sed -i "s/^THUMB=.*/THUMB='$FP'/" run.sh; cp good.pem "$T"; M="$(PATH=/usr/bin:/bin bash run.sh "$T" 2>&1)"; echo "nohaproxy=$? untouched=$(cmp -s good.pem "$T" && echo y || echo n) early=$(echo "$M" | grep -q 'Nothing was changed' && echo y || echo n) backups=$(ls bak | wc -l | tr -d ' ')"
+rm -rf certificate.pfx good.pem "$T" bak w
+'@
+    [IO.File]::WriteAllText($runSh, ($runText -replace "`r`n", "`n"))
+    $o = (& $bash $runSh.Replace('\', '/') $hp 2>&1 | Out-String)
+    Write-Host $o.Trim()
+    $exp = if ($o -match 'expect=([0-9A-F]+)') { $Matches[1] } else { 'none' }
+    Assert-That 'HAProxy script --check: converts and verifies, installs nothing' ($o -match 'check=0 installed=n')
+    Assert-That 'HAProxy script: installs PEM with key + right certificate, backup outside certs, reload' ($o -match "install=0 reload=1 key=2 certfp=$exp backups=1 incerts=1")
+    Assert-That 'HAProxy script: haproxy -c failure restores the previous file' ($o -match 'badcfg=1 restored=older')
+    Assert-That 'HAProxy script: wrong PFX (thumbprint) refused' ($o -match 'wrongthumb=1')
+    Assert-That 'HAProxy script: haproxy not installed -> stops before touching the file' ($o -match 'nohaproxy=1 untouched=y early=y backups=2')
+}
 
 # ---------------------------------------------------------------------------------------------
 # -ForceRenew never "renews" to the certificate that is already on IIS
