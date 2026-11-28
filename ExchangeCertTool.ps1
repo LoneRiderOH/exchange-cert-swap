@@ -1883,14 +1883,45 @@ $script:ExoPrefix = 'Cloud'
 
 function Test-ExoConnected { [bool](Get-Command "Get-$($script:ExoPrefix)InboundConnector" -ErrorAction SilentlyContinue) }
 
+# Loads ExchangeOnlineManagement; offers to install it from the PowerShell Gallery when it is missing.
+function Import-ExoModule {
+    if (Get-Module ExchangeOnlineManagement) { return }
+    $psd = Find-ModuleManifest 'ExchangeOnlineManagement'
+    if (-not $psd) {
+        Write-Log "ExchangeOnlineManagement not found for $env:USERDOMAIN\$env:USERNAME. Searched:" WARN
+        foreach ($r in Get-ModuleSearchRoots) { Write-Log ("    {0}  {1}" -f $(if (Test-Path -LiteralPath $r) { '[exists] ' } else { '[missing]' }), $r) }
+        $manual = 'In Windows PowerShell (powershell.exe) run:  Install-Module ExchangeOnlineManagement -Scope CurrentUser'
+        if ($script:Unattended) { throw "The ExchangeOnlineManagement module is not installed. $manual" }
+        $msg = "Step D needs Microsoft's ExchangeOnlineManagement module, which is not installed for $env:USERNAME on $env:COMPUTERNAME.`n`n" +
+        "Install it now from the PowerShell Gallery?`n  Install-Module ExchangeOnlineManagement -Scope CurrentUser`n`n" +
+        'This only installs a module on this computer and changes nothing in Exchange, so it also runs with Dry run on. Needs internet access to www.powershellgallery.com.'
+        if (-not (Confirm-Action $msg 'Install ExchangeOnlineManagement')) { throw "The ExchangeOnlineManagement module is not installed. $manual - then click the button again." }
+        Install-GalleryModule -Name 'ExchangeOnlineManagement'
+        $psd = Find-ModuleManifest 'ExchangeOnlineManagement'
+        if (-not $psd) { throw 'Install-Module finished, but ExchangeOnlineManagement was not found in the module folders (see the log).' }
+    }
+    try { Import-Module $psd -ErrorAction Stop }
+    catch { throw "ExchangeOnlineManagement was found at $psd but could not be loaded: $($_.Exception.Message)  [If the files were copied from another machine, run: Get-ChildItem '$(Split-Path $psd)' -Recurse | Unblock-File]" }
+    Write-Log "Loaded ExchangeOnlineManagement $((Get-Module ExchangeOnlineManagement).Version) from $psd." OK
+}
+
+# Installs a module for the current user from the PowerShell Gallery (Windows PowerShell 5.1: TLS 1.2 + NuGet provider first).
+function Install-GalleryModule {
+    param([Parameter(Mandatory)][string]$Name)
+    Write-Log "Install-Module $Name -Scope CurrentUser -Repository PSGallery" CMD
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $nuget = Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' }
+    if (-not $nuget) { Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null }
+    Install-Module $Name -Scope CurrentUser -Repository PSGallery -Force -AllowClobber -ErrorAction Stop
+    $installed = @(Get-InstalledModule $Name -ErrorAction SilentlyContinue | Select-Object -First 1)
+    Write-Log "$Name installed$(if ($installed) { ": $($installed[0].Version) in $($installed[0].InstalledLocation)" })." OK
+}
+
 function Connect-ExoSession {
     if (Test-ExoConnected) { return }
     if ($script:Unattended) { throw 'Exchange Online needs an interactive sign-in - not available in an unattended run.' }
-    if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
-        throw 'The ExchangeOnlineManagement module is not installed. In Windows PowerShell run:  Install-Module ExchangeOnlineManagement -Scope CurrentUser  - then click the button again.'
-    }
+    Import-ExoModule
     Write-Log 'Connecting to Exchange Online - sign in with an Exchange administrator of the tenant (read-only until you click Step D with Dry run off).'
-    Import-Module ExchangeOnlineManagement -ErrorAction Stop
     Connect-ExchangeOnline -Prefix $script:ExoPrefix -ShowBanner:$false -ErrorAction Stop
     if (-not (Test-ExoConnected)) { throw 'Connected, but the connector cmdlets are not available - the account needs an Exchange administrator role in Exchange Online.' }
     $script:ExoConnectedByTool = $true
@@ -2373,10 +2404,10 @@ $script:LeWebConfig = @'
 # Folders searched for Posh-ACME in addition to $env:PSModulePath. Windows PowerShell 5.1 does not see
 # modules installed from PowerShell 7 (Documents\PowerShell\Modules), and a user-level PSModulePath
 # environment variable or redirected Documents folder can hide the normal CurrentUser path.
-function Get-PoshAcmeSearchRoots {
+function Get-ModuleSearchRoots {
     $docs = @([Environment]::GetFolderPath('MyDocuments'), (Join-Path $env:USERPROFILE 'Documents'))
     if ($env:OneDrive) { $docs += (Join-Path $env:OneDrive 'Documents') }
-    $roots = @(Join-Path $PSScriptRoot 'Modules')   # portable copy: Save-Module Posh-ACME -Path .\Modules
+    $roots = @(Join-Path $PSScriptRoot 'Modules')   # portable copy: Save-Module <name> -Path .\Modules
     foreach ($d in ($docs | Where-Object { $_ } | Select-Object -Unique)) {
         $roots += (Join-Path $d 'WindowsPowerShell\Modules')
         $roots += (Join-Path $d 'PowerShell\Modules')
@@ -2387,13 +2418,15 @@ function Get-PoshAcmeSearchRoots {
     @($roots | Where-Object { $_ } | Select-Object -Unique)
 }
 
-# Returns the path of the newest Posh-ACME.psd1 found, or $null.
-function Find-PoshAcmeManifest {
+# Path of the newest <Name>.psd1 in the module folders of Windows PowerShell, PowerShell 7, OneDrive and .\Modules, or $null.
+# Windows PowerShell 5.1 does not search the PowerShell 7 folders itself, so modules installed from pwsh are found here too.
+function Find-ModuleManifest {
+    param([Parameter(Mandatory)][string]$Name)
     $found = New-Object System.Collections.Generic.List[object]
-    foreach ($root in Get-PoshAcmeSearchRoots) {
-        $dir = Join-Path $root 'Posh-ACME'
+    foreach ($root in Get-ModuleSearchRoots) {
+        $dir = Join-Path $root $Name
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
-        foreach ($psd in @(Get-ChildItem -LiteralPath $dir -Filter 'Posh-ACME.psd1' -Recurse -Depth 1 -File -ErrorAction SilentlyContinue)) {
+        foreach ($psd in @(Get-ChildItem -LiteralPath $dir -Filter "$Name.psd1" -Recurse -Depth 1 -File -ErrorAction SilentlyContinue)) {
             $ver = [version]'0.0'
             try { $ver = [version](Import-PowerShellDataFile -LiteralPath $psd.FullName).ModuleVersion } catch { }
             $found.Add([pscustomobject]@{ Path = $psd.FullName; Version = $ver })
@@ -2404,11 +2437,13 @@ function Find-PoshAcmeManifest {
     return $null
 }
 
+function Find-PoshAcmeManifest { Find-ModuleManifest 'Posh-ACME' }
+
 function Test-PoshAcme { [bool](Get-Command New-PAOrder -ErrorAction SilentlyContinue) -or [bool](Find-PoshAcmeManifest) }
 
 function Write-PoshAcmeDiagnostics {
     Write-Log "Posh-ACME not found for $env:USERDOMAIN\$env:USERNAME (PowerShell $($PSVersionTable.PSVersion), $([IntPtr]::Size * 8)-bit). Searched:" WARN
-    foreach ($r in Get-PoshAcmeSearchRoots) { Write-Log ("    {0}  {1}" -f $(if (Test-Path -LiteralPath $r) { '[exists] ' } else { '[missing]' }), $r) }
+    foreach ($r in Get-ModuleSearchRoots) { Write-Log ("    {0}  {1}" -f $(if (Test-Path -LiteralPath $r) { '[exists] ' } else { '[missing]' }), $r) }
     Write-Log 'Install it in WINDOWS PowerShell (powershell.exe, not pwsh) as the same user that runs this tool: Install-Module Posh-ACME -Scope CurrentUser. Offline: Save-Module Posh-ACME -Path <tool folder>\Modules on another machine and copy the folder.' WARN
 }
 

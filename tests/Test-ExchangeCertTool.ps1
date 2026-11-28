@@ -511,6 +511,33 @@ Assert-That 'EXO plan: foreign gateway, IP-only and non-validating connectors le
 $chg2 = @(Get-ExoConnectorPlan -Inbound $inb -Outbound $outb -Names @('smtp.contoso.com') -Subject 'CN=smtp.contoso.com' -OwnNames @('mail.contoso.com'))
 Assert-That 'EXO plan, renamed host: inbound and outbound set to the new CN' ((@($chg2 | Where-Object { $_.Action -eq 'UPDATE' -and $_.New -eq 'smtp.contoso.com' })).Count -eq 2)
 
+# Module discovery and one-click install for ExchangeOnlineManagement (fake module, fake Install-Module)
+$modRoot = Join-Path $tmp 'mods'
+function Get-ModuleSearchRoots { @($modRoot, (Join-Path $tmp 'mods7')) }   # never the real module folders
+function New-FakeExoModule([string]$Root, [string]$Version) {
+    $d = Join-Path $Root "ExchangeOnlineManagement\$Version"; New-Item -ItemType Directory -Path $d -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $d 'ExchangeOnlineManagement.psm1') -Value 'function Connect-ExchangeOnline { param($Prefix, [switch]$ShowBanner, $ErrorAction) $global:ExoConnect = "Prefix=$Prefix" }'
+    Set-Content -LiteralPath (Join-Path $d 'ExchangeOnlineManagement.psd1') -Value "@{ RootModule = 'ExchangeOnlineManagement.psm1'; ModuleVersion = '$Version'; GUID = '$([guid]::NewGuid())'; FunctionsToExport = @('Connect-ExchangeOnline') }"
+}
+New-FakeExoModule (Join-Path $tmp 'mods7') '3.4.0'; New-FakeExoModule (Join-Path $tmp 'mods7') '3.9.2'
+Assert-That 'module search: newest version found in the PowerShell 7 folder' ((Find-ModuleManifest 'ExchangeOnlineManagement') -match '3\.9\.2\\ExchangeOnlineManagement\.psd1$')
+Remove-Item -LiteralPath (Join-Path $tmp 'mods7') -Recurse -Force
+$e = $null; try { Import-ExoModule } catch { $e = $_.Exception.Message }
+Assert-That 'module missing, unattended: clear error with the Install-Module command' ($e -match 'Install-Module ExchangeOnlineManagement -Scope CurrentUser' -and ((& $logText) -match 'ExchangeOnlineManagement not found'))
+$keepConfirm = ${function:Confirm-Action}; $global:Installed = @()
+function Confirm-Action { param($Message, $Title) $global:AskedTitle = $Title; $true }
+function Install-Module { param($Name, $Scope, $Repository, [switch]$Force, [switch]$AllowClobber, $ErrorAction) $global:Installed += "$Name/$Scope"; New-FakeExoModule $modRoot '3.9.2' }
+function Get-PackageProvider { [pscustomobject]@{ Name = 'NuGet'; Version = [version]'2.8.5.208' } }
+function Get-InstalledModule { param($Name, $ErrorAction) [pscustomobject]@{ Version = '3.9.2'; InstalledLocation = "$modRoot\ExchangeOnlineManagement\3.9.2" } }
+$script:Unattended = $false; $global:ExoConnect = $null
+$e = $null; try { Connect-ExoSession } catch { $e = $_.Exception.Message }
+$script:Unattended = $true
+Assert-That 'module missing: asks, installs for CurrentUser, loads it and connects with prefix Cloud' ($AskedTitle -eq 'Install ExchangeOnlineManagement' -and ($Installed -join ',') -eq 'ExchangeOnlineManagement/CurrentUser' -and (Get-Module ExchangeOnlineManagement).Version -eq [version]'3.9.2' -and $ExoConnect -eq 'Prefix=Cloud')
+Assert-That 'connect without connector cmdlets: reports the missing admin role' ($e -match 'needs an Exchange administrator role')
+Remove-Module ExchangeOnlineManagement -Force -ErrorAction SilentlyContinue
+Set-Item -Path function:Confirm-Action -Value $keepConfirm
+Remove-Item function:Install-Module, function:Get-PackageProvider, function:Get-InstalledModule, function:Get-ModuleSearchRoots
+
 # Step D end to end against mocked Exchange Online
 $global:Cloud = @{ In = @($inb | ForEach-Object { $_.PSObject.Copy() }); Out = @($outb | ForEach-Object { $_.PSObject.Copy() }) }
 function global:Get-CloudInboundConnector { [CmdletBinding()] param($Identity) if ($Identity) { $Cloud.In | Where-Object Identity -eq $Identity } else { $Cloud.In } }
