@@ -108,6 +108,7 @@ $script:RenewalProfileFile = Join-Path $tmp 'renewal.json'
 $env:POSHACME_HOME = Join-Path $tmp 'pa'   # empty: keeps the real Posh-ACME folder out of the tests
 New-Item -ItemType Directory -Path $env:POSHACME_HOME | Out-Null
 $logText = { Get-Content -LiteralPath $script:LogFile -Raw }
+$script:RealFindAcme = ${function:Find-AcmeSavedCertificates}   # kept before a test replaces it with a mock
 
 # DNS is mocked: contoso.com MX = mail.contoso.com (these servers), fabrikam.com MX = old.fabrikam.com
 $script:MockTlsa = @{}
@@ -171,6 +172,15 @@ Assert-That 'Auth renewal (dry run) logs New-ExchangeCertificate and changes not
 ($Org.Certs['EX01'] | Where-Object { $_.Thumbprint -eq 'AUTH1' }).NotAfter = (Get-Date).AddDays(900)
 Invoke-AuthCertificate
 Assert-That 'Auth copy (dry run) when only a server misses it' (((& $logText) -match '\[DRY RUN\] Export-ExchangeCertificate -Server EX01 -Thumbprint AUTH1') -and $Calls.Count -eq 0)
+# Get-AuthConfig failing must not look like "no Auth certificate" (that would replace a working one)
+$realAuthConfig = ${function:global:Get-AuthConfig}
+function global:Get-AuthConfig { [CmdletBinding()] param() throw 'session lost' }
+$script:ui.DryRunCheck.IsChecked = $false
+$Calls.Clear(); $e = $null
+try { Invoke-AuthCertificate } catch { $e = $_.Exception.Message }
+Assert-That 'Auth: Get-AuthConfig failure stops the button, nothing created' ($e -match 'Get-AuthConfig did not answer' -and @($Calls -like 'New-ExchangeCertificate*').Count -eq 0 -and @($Calls -like 'Set-AuthConfig*').Count -eq 0)
+Set-Item -Path function:global:Get-AuthConfig -Value $realAuthConfig
+$script:ui.DryRunCheck.IsChecked = $true
 Reset-MockOrg
 Update-Inventory
 
@@ -307,6 +317,54 @@ $t = $null; $e = $null
 $edgeText = Get-Content -LiteralPath $edgeScript -Raw
 Assert-That 'Edge package: generated script parses' (-not $e)
 Assert-That "Edge package: thumbprint and escaped TLS name (Let''s Encrypt) inserted" ($edgeText -match "\`$thumb = 'NEW1'" -and $edgeText -match "O=Let''s Encrypt" -and (Test-Path (Join-Path $edgeDir.FullName 'certificate.pfx')))
+
+# ---------------------------------------------------------------------------------------------
+# -ForceRenew never "renews" to the certificate that is already on IIS
+# ---------------------------------------------------------------------------------------------
+$order = Join-Path $env:POSHACME_HOME 'acme-v02.api.letsencrypt.org\1\mail.contoso.com'
+New-Item -ItemType Directory -Path $order -Force | Out-Null
+[IO.File]::WriteAllBytes((Join-Path $order 'fullchain.pfx'), [byte[]](1..64))
+[IO.File]::WriteAllBytes((Join-Path $order 'cert.cer'), $leafCert.RawData)   # public certificate only
+@{ MainDomain = 'mail.contoso.com'; PfxPassB64U = 'eA'; CertExpires = (Get-Date).AddDays(80).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $order 'order.json')
+$saved = @(& $script:RealFindAcme)
+Assert-That 'saved ACME certificate: thumbprint read from cert.cer' ($saved.Count -eq 1 -and $saved[0].Thumbprint -eq $leafCert.Thumbprint)
+
+$iisThumb = "$(($Org.Certs['EX01'] | Where-Object { -not $_.IsSelfSigned -and $_.Services -match 'IIS' } | Select-Object -First 1).Thumbprint)"
+$Live = $false; $RemoveOld = $false; $ForceRenew = $true
+function Find-AcmeSavedCertificates { [pscustomobject]@{ Path = $dummyPfx; Password = '***'; MainDomain = 'mail.contoso.com'; Expires = (Get-Date).AddDays(80); Written = (Get-Date); Server = 'acme-v02.api.letsencrypt.org'; Thumbprint = $iisThumb } }
+$mark = (& $logText).Length; $Calls.Clear()
+Invoke-UnattendedRenewal
+$runLog = (& $logText).Substring($mark)
+Assert-That "-ForceRenew: certificate already on IIS ($iisThumb) is not reused, a new one is requested" ($runLog -notmatch 'Reusing the certificate' -and $runLog -match 'Dry run: stopped after the ACME step' -and $Calls.Count -eq 0)
+
+function Find-AcmeSavedCertificates { [pscustomobject]@{ Path = $dummyPfx; Password = '***'; MainDomain = 'mail.contoso.com'; Expires = (Get-Date).AddDays(80); Written = (Get-Date); Server = 'acme-v02.api.letsencrypt.org'; Thumbprint = $null } }
+$mark = (& $logText).Length
+Invoke-UnattendedRenewal
+$runLog = (& $logText).Substring($mark)
+Assert-That '-ForceRenew: saved certificate with unknown thumbprint is not reused' ($runLog -notmatch 'Reusing the certificate' -and $runLog -match 'Dry run: stopped after the ACME step')
+
+# Validation says the reused PFX is the IIS certificate (e.g. cert.cer missing): rejected after validation too
+function Find-AcmeSavedCertificates { [pscustomobject]@{ Path = $dummyPfx; Password = '***'; MainDomain = 'mail.contoso.com'; Expires = (Get-Date).AddDays(80); Written = (Get-Date); Server = 'acme-v02.api.letsencrypt.org'; Thumbprint = 'SOMETHINGELSE' } }
+$Org.NewCert.Thumbprint = $iisThumb
+$mark = (& $logText).Length
+Invoke-UnattendedRenewal
+$runLog = (& $logText).Substring($mark)
+Assert-That '-ForceRenew: reused PFX that validates as the IIS certificate is dropped' ($runLog -match 'is the one already on IIS - not reused' -and $runLog -match 'Dry run: stopped after the ACME step')
+$ForceRenew = $false
+
+# ---------------------------------------------------------------------------------------------
+# POP/IMAP: no restart when nothing changed
+# ---------------------------------------------------------------------------------------------
+$script:ui.DryRunCheck.IsChecked = $true
+$Org.Pop['EX01'] = 'mail.contoso.com'
+$script:State.NewNames = @('mail.contoso.com', 'autodiscover.contoso.com')
+$mark = (& $logText).Length
+Set-PopImapCertificateName -Server 'EX01' -ServicesChanged $false
+$runLog = (& $logText).Substring($mark)
+Assert-That 'POP/IMAP: names already on the certificate and services unchanged -> no restart' ($runLog -notmatch 'Restart the running POP3/IMAP4' -and $runLog -match 'services not restarted')
+$mark = (& $logText).Length
+Set-PopImapCertificateName -Server 'EX01' -ServicesChanged $true
+Assert-That 'POP/IMAP: restart when the certificate was just enabled for POP/IMAP' ((& $logText).Substring($mark) -match '\[DRY RUN\] Restart the running POP3/IMAP4')
 
 # ---------------------------------------------------------------------------------------------
 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

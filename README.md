@@ -108,6 +108,7 @@ Exchange signs OAuth tokens with the self-signed *Microsoft Exchange Server Auth
 |---|---|
 | Valid for 60 days or more, on every selected server | Nothing |
 | Valid for 60 days or more, missing on some selected servers | Copies it there (`Export-ExchangeCertificate` / `Import-ExchangeCertificate`) |
+| `Get-AuthConfig` doesn't answer | Stops and changes nothing, because the current Auth certificate is unknown. It never treats a failed lookup as "no Auth certificate". |
 | Expires within 60 days, expired or missing | Creates a new one with `New-ExchangeCertificate` on the first selected server, copies it to all selected servers, then runs `Set-AuthConfig -NewCertificateThumbprint … -NewCertificateEffectiveDate (Get-Date)`, `-PublishCertificate` and `-ClearPreviousCertificate`. Finally it restarts *MSExchangeServiceHost* and recycles the OWA and ECP app pools on each server through PowerShell remoting. |
 
 Select **all** Exchange servers on tab 1 first; the confirmation warns about servers that aren't selected. `Set-AuthConfig` is changed only after the new certificate is on every selected server, and the log contains the rollback command. In a **hybrid** deployment, rerun the Hybrid Configuration Wizard afterwards so Exchange Online trusts the new certificate. Tab 5 never removes the current, previous or next Auth certificate.
@@ -257,7 +258,7 @@ Posh-ACME keeps the account, the orders and the issued files in `%LOCALAPPDATA%\
 **What a run does**
 
 1. Checks the days left on the certificate bound to IIS on the saved servers. With 30 days or more left, it stops (exit code 0, no e-mail).
-2. Reuses a certificate that an earlier run already issued but didn't install, so repeated failures don't use up the CA's rate limits. Otherwise it requests a new one with the saved settings.
+2. Reuses a certificate that an earlier run already issued but didn't install, so repeated failures don't use up the CA's rate limits. Otherwise it requests a new one with the saved settings. A certificate that is already on IIS is never reused, so `-ForceRenew` always gets a new certificate.
 3. Validates it. It **stops before changing Exchange** if the new certificate no longer covers a name that the current one covers, or if a [mail flow check](#mail-flow-checks) finds a problem.
 4. Runs Step A, B and C. Step C only switches connectors that are pinned to the old certificate; it doesn't pin new ones. POP/IMAP is included only if the old certificate was enabled for it. If a step logs an error, the run stops; the snapshot from Step B or C can be restored on tab 3 with **Roll back**.
 5. Verifies every server, retrying once after 2 minutes.
@@ -303,7 +304,7 @@ For your own experiments, dot-source the script with `-LoadOnly`. This defines t
 | `-Live` | With `-Renew`: make the changes |
 | `-RemoveOld` | With `-Renew`: remove the previous IIS certificate after every server passed verification |
 | `-RenewDays <n>` | With `-Renew`: renew when the current certificate has fewer days left. Default: 30 |
-| `-ForceRenew` | With `-Renew`: renew now, whatever the days left |
+| `-ForceRenew` | With `-Renew`: request a new certificate now, whatever the days left (never reuses the one on IIS) |
 | `-NotifyTo <address[]>` | With `-Renew`: e-mail the log to these addresses when a renewal ran, failed or was a dry run |
 | `-NotifyFrom <address>` | With `-Renew`: sender address. Default: `ExchangeCertTool@<default accepted domain>` |
 | `-SmtpServer <host>` | With `-Renew`: SMTP server for the e-mail. Default: `localhost` (the Exchange server itself) |

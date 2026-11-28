@@ -105,6 +105,7 @@ $script:State = @{
     Servers      = @{}      # name -> @{ Fqdn; Version; InternalTransportThumb }
     Inventory    = @()
     AuthThumb    = $null
+    AuthConfigRead = $false # Get-AuthConfig answered in the last inventory (Invoke-AuthCertificate needs it)
     PfxPath      = $null
     PfxPassword  = $null    # SecureString
     NewCert      = $null    # X509Certificate2 (leaf)
@@ -465,8 +466,10 @@ function Update-Inventory {
     $servers = Get-SelectedServers
     if (-not $servers) { throw 'Select at least one server on tab 1.' }
     $authConfig = $null
+    $script:State.AuthConfigRead = $false
     try {
-        $authConfig = Get-AuthConfig
+        $authConfig = Get-AuthConfig -ErrorAction Stop
+        $script:State.AuthConfigRead = $true
         $script:State.AuthThumb = "$($authConfig.CurrentCertificateThumbprint)"
         $script:State.AuthOtherThumbs = @("$($authConfig.PreviousCertificateThumbprint)", "$($authConfig.NextCertificateThumbprint)" | Where-Object { $_ })
         Write-Log "Auth (OAuth) certificate: $($script:State.AuthThumb)"
@@ -982,7 +985,13 @@ function Find-AcmeSavedCertificates {
             }
             catch { }
         }
-        [pscustomobject]@{ Path = $pfx.FullName; Password = $pw; MainDomain = $main; Expires = $expires; Written = $pfx.LastWriteTime
+        # Thumbprint from cert.cer (public certificate only - no private key is read or stored).
+        $thumb = $null
+        $cer = Join-Path $pfx.DirectoryName 'cert.cer'
+        if (Test-Path -LiteralPath $cer) {
+            try { $thumb = (New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 (, [IO.File]::ReadAllBytes($cer))).Thumbprint } catch { }
+        }
+        [pscustomobject]@{ Path = $pfx.FullName; Password = $pw; MainDomain = $main; Expires = $expires; Written = $pfx.LastWriteTime; Thumbprint = $thumb
             Server = (Split-Path (Split-Path (Split-Path $pfx.DirectoryName -Parent) -Parent) -Leaf) }
     }
 }
@@ -1258,10 +1267,13 @@ function Invoke-EnableCertificate {
         try {
             $before = "$((Get-TransportService -Identity $s).InternalTransportCertificateThumbprint)"
             Write-Log "${s}: internal transport certificate before: $before"
+            $popImapBefore = @()
+            if ($popImap) { $cur = Get-ExchangeCertSafe -Server $s -Thumbprint $thumb; if ($cur) { $popImapBefore = @(Get-ServiceList $cur) } }
+            $popImapNew = $popImap -and -not (($popImapBefore -contains 'POP') -and ($popImapBefore -contains 'IMAP'))
             Invoke-Step "Enable-ExchangeCertificate -Server $s -Thumbprint $thumb -Services $($services -join ',') -Force" {
                 Enable-ExchangeCertificate -Server $s -Thumbprint $thumb -Services $services -Force -ErrorAction Stop
             }
-            if ($popImap) { Set-PopImapCertificateName -Server $s }
+            if ($popImap) { Set-PopImapCertificateName -Server $s -ServicesChanged $popImapNew }
             if (Test-DryRun) {
                 if (-not $replaceInternal) { Write-Log "[DRY RUN] ${s}: would restore internal transport certificate to $before if Enable-ExchangeCertificate replaced it." CMD }
                 continue
@@ -1290,7 +1302,7 @@ function Invoke-EnableCertificate {
 
 # POP3/IMAP4 pick their certificate by X509CertificateName: point it at a name on the new certificate, then restart.
 function Set-PopImapCertificateName {
-    param([string]$Server)
+    param([string]$Server, [bool]$ServicesChanged = $true)   # ServicesChanged: the new certificate was just enabled for POP/IMAP
     $names = @($script:State.NewNames)
     $target = @($names | Where-Object { $_ -notmatch '\*' } | Select-Object -First 1)[0]
     if (-not $target) { $target = ($names | Select-Object -First 1) -replace '^\*\.', 'mail.' }
@@ -1302,6 +1314,10 @@ function Set-PopImapCertificateName {
         Write-Log "Rollback for ${Server} ${kind}: Set-${kind}Settings -Server $Server -X509CertificateName $(if ($cur) { $cur } else { '$null' })"
         Invoke-Step "Set-${kind}Settings -Server $Server -X509CertificateName $target" { & "Set-${kind}Settings" -Server $Server -X509CertificateName $target -ErrorAction Stop }
         $changed = $true
+    }
+    if (-not $changed -and -not $ServicesChanged) {
+        Write-Log "${Server}: POP/IMAP already use the new certificate - services not restarted."
+        return
     }
     $fqdn = Get-ServerFqdn $Server
     Invoke-Step "Restart the running POP3/IMAP4 services on $fqdn" {
@@ -1478,6 +1494,10 @@ function Invoke-AuthCertificate {
     $servers = @(Get-SelectedServers)
     if (-not $servers) { throw 'Select at least one server on tab 1.' }
     Update-Inventory
+    # Without an answer from Get-AuthConfig, "no Auth certificate" is unknown, not a fact: never replace a working one.
+    if (-not $script:State.AuthConfigRead) {
+        throw 'Get-AuthConfig did not answer (see the log), so the current Auth certificate is unknown. Nothing was changed. Check the Exchange connection and try again.'
+    }
     $thumb = $script:State.AuthThumb
     $have = @($script:State.Inventory | Where-Object { $thumb -and $_.Thumbprint -eq $thumb })
     $missing = @($servers | Where-Object { $_ -notin @($have | ForEach-Object { $_.Server }) })
@@ -2898,15 +2918,24 @@ function Invoke-UnattendedRenewal {
 
         # A certificate that an earlier run issued but did not finish installing (e.g. import failed) is reused, so
         # repeated failures do not use up the CA's rate limits (Let's Encrypt: 5 identical certificates per week).
-        # It cannot be the certificate on IIS: that one has fewer than -RenewDays left, or we would have stopped above.
+        # Never the certificate that is already on IIS: with -ForceRenew it has more than -RenewDays left, and
+        # "renewing" to it would change nothing. Without a known thumbprint, -ForceRenew does not reuse at all.
         $first = "$(@($settings.Names)[0])"
-        $reuse = @(Find-AcmeSavedCertificates | Where-Object { $_.MainDomain -eq $first -and $_.Server -notmatch 'stag|test|preprod' -and $_.Expires -and ($_.Expires - (Get-Date)).TotalDays -gt $RenewDays } |
+        $onIis = @($oldIis | ForEach-Object { "$($_.Thumbprint)" })
+        Reset-Validation   # start from nothing: only a certificate validated in this run may be installed
+        $reuse = @(Find-AcmeSavedCertificates | Where-Object {
+                $_.MainDomain -eq $first -and $_.Server -notmatch 'stag|test|preprod' -and $_.Expires -and ($_.Expires - (Get-Date)).TotalDays -gt $RenewDays -and
+                $(if ($_.Thumbprint) { $onIis -notcontains $_.Thumbprint } else { -not $ForceRenew }) } |
             Sort-Object Written -Descending | Select-Object -First 1)
         if ($reuse) {
             Write-Log "Reusing the certificate Posh-ACME issued on $($reuse[0].Written.ToString('yyyy-MM-dd HH:mm')) (expires $($reuse[0].Expires.ToString('yyyy-MM-dd'))): $($reuse[0].Path)" OK
             $ui.PfxPathBox.Text = $reuse[0].Path
             $ui.PfxPasswordBox.Password = $reuse[0].Password
             try { $null = Invoke-ValidatePfx } catch { Write-Log "The saved certificate could not be validated: $($_.Exception.Message)" WARN }
+            if ($script:State.Validated -and $onIis -contains $script:State.NewThumb) {
+                Write-Log "The saved certificate $($script:State.NewThumb) is the one already on IIS - not reused." WARN
+                Reset-Validation
+            }
             if (-not $script:State.Validated) { Write-Log 'The saved certificate is not usable - requesting a new one.' WARN }
         }
         if (-not $script:State.Validated) {
