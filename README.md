@@ -30,14 +30,18 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 - **Automatic renewal**: `-Renew` renews a free certificate from a scheduled task and installs it on all servers. See [Automatic renewal](#automatic-renewal--renew).
 - **Safe removal of the old certificate**: a certificate is removed only if:
   - its server passed verification
-  - it is not the Auth or internal transport certificate
+  - it is not the current, previous or next Auth certificate, or the internal transport certificate
   - it is no longer bound to IIS
-  - no connector points to it
+  - no connector and not the hybrid configuration points to it
 
   You confirm each removal.
 - **Dry run by default**: every command is logged instead of being run. You turn Dry run off on purpose, and the header switches to red **LIVE MODE**.
 - **Full log**: each run writes `logs\CertSwap_<timestamp>.log` next to the script (`CertRenew_<timestamp>.log` for `-Renew`). PFX passwords are never logged.
-- **No private key is written to the machine that runs the tool**: the PFX is opened with `EphemeralKeySet`, so its key stays in memory. It never goes into a Windows key store or onto a smart card or hardware token. The key is installed only on the Exchange servers, through `Import-ExchangeCertificate`.
+- **No private key goes into a key store on the machine that runs the tool**: the PFX is opened with `EphemeralKeySet`, so its key stays in memory. It never goes into a Windows key store or onto a smart card or hardware token. The key is installed only on the Exchange servers, through `Import-ExchangeCertificate`. Two features do keep the key **in files**:
+  - **Free certificates**: Posh-ACME saves the issued certificate and its key in `%LOCALAPPDATA%\Posh-ACME`.
+  - **The Edge package**: it puts a copy of the PFX in `logs\EdgePackage_*`.
+
+  Protect or delete those folders.
 
 ## Requirements
 
@@ -48,7 +52,7 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 | PowerShell | **Windows PowerShell 5.1** (`powershell.exe`, not PowerShell 7), run as administrator |
 | .NET Framework | 4.7.2 or newer |
 | Permissions | Organization Management (or a role that can manage Exchange certificates, connectors and transport services) |
-| Network | From the machine running the tool to each server's FQDN on TCP 443 (and 25 for the SMTP check, 995/993 for POP/IMAP). **PowerShell remoting** (WinRM, 5985) to each server for the Auth certificate renewal and the rolling restart. Outbound HTTPS to `dns.google` or `cloudflare-dns.com` for the DANE check (skipped if blocked). |
+| Network | From the machine running the tool to each server's FQDN on TCP 443 (and 25 for the SMTP check, 995/993 for POP/IMAP). **PowerShell remoting** (WinRM, 5985) to each server for the Auth certificate renewal and the rolling restart. Remote service control (RPC/SMB, 135/445) to restart Frontend Transport and POP/IMAP. Outbound HTTPS to `dns.google` or `cloudflare-dns.com` for the DANE check (skipped if blocked). |
 | Certificate | A PFX (`.pfx`/`.p12`) **with private key**, ideally including the intermediate CA certificates, **or** a free ACME certificate (see below) |
 | Free certificates only | The [Posh-ACME](https://www.powershellgallery.com/packages/Posh-ACME) module (the tool can install it), outbound HTTPS to the CA's ACME server, and public DNS names. HTTP-01 also needs inbound port 80 from the internet to the Exchange servers and admin share access (`\\server\C$`) to each server. |
 
@@ -68,7 +72,7 @@ A single-file PowerShell **WPF GUI** for replacing the public IIS/SMTP certifica
 
 ## Step-by-step
 
-> Keep **Dry run** ticked for your first pass and read the log. Then untick it and repeat the steps that change things (3 and 5).
+> Keep **Dry run** ticked for your first pass and read the log. Then untick it and repeat the steps that change things: tab 1b, tab 3 and tab 5, plus the *Auth*, *CSR* and *Rolling restart* buttons.
 
 | Tab | What happens | Changes anything? |
 |---|---|---|
@@ -135,7 +139,7 @@ Tab 5 won't remove the old certificate while any connector still points to it.
 
 ## POP3 and IMAP4
 
-Tick *Also enable it for POP3 and IMAP4* on tab 3 only if clients use them. Step B then enables the certificate for POP and IMAP too. If `X509CertificateName` in `Get-PopSettings`/`Get-ImapSettings` is not a name on the new certificate, the tool sets it to the first non-wildcard name (the log contains the previous value), and it restarts the POP3 and IMAP4 services that are running. Tab 4 then checks ports 995 and 993.
+Tick *Also enable it for POP3 and IMAP4* on tab 3 only if clients use them. Step B then enables the certificate for POP and IMAP too. If `X509CertificateName` in `Get-PopSettings`/`Get-ImapSettings` is not a name on the new certificate, the tool sets it to the first non-wildcard name (the log contains the previous value). It restarts the running POP3 and IMAP4 services only when something changed: the name, or the certificate was just enabled for POP/IMAP. Tab 4 then checks ports 995 and 993.
 
 ## Mail flow checks
 
@@ -278,9 +282,26 @@ Without `-Live`, the run is a dry run: it stops before the ACME request (or, if 
 - **HTTP-01 fails with 403**: *Require SSL* is set on the root of *Default Web Site*. Use DNS-01, or allow HTTP for `/.well-known/acme-challenge` only.
 - The **Exchange Back End** site (port 444) is never changed. The **Auth certificate** changes only when you click **Renew / copy Auth certificate** on tab 1.
 
+## Known limitations
+
+- **Rollback** restores only certificates and names that are in the snapshot:
+  - If IIS used a **self-signed** certificate before, IIS can't be rolled back to it.
+  - A POP/IMAP `X509CertificateName` that was **empty** before isn't cleared again.
+- **POP/IMAP with a wildcard-only certificate**: the name is set to `mail.<domain>`. Check that this name exists in DNS, or set `X509CertificateName` yourself.
+- **CSR created twice for the same name on different servers**: *Complete pending request* can leave a copy without a private key on the server that doesn't own the key. The log reports it as an error; remove that copy by hand.
+- **`-Renew` from a scheduled task** is tested against mock cmdlets only. Before relying on it, do one dry run from the task itself, as the task's user.
+- **Edge Transport, Exchange 2013 and older**: not managed directly (see above).
+
 ## Testing without Exchange
 
-`tests\Test-ExchangeCertTool.ps1` runs the tool against mock Exchange cmdlets (two servers, sample certificates and connectors). It needs no Exchange and no network, and it doesn't create certificates or keys. It covers the inventory, validation of an installed certificate, the mail flow checks, Steps B and C, snapshots and rollback, the Auth certificate, the Edge package and an unattended renewal. It prints PASS/FAIL per check and exits with 1 if any check fails:
+`tests\Test-ExchangeCertTool.ps1` runs the tool against mock Exchange cmdlets (two servers, sample certificates and connectors). It needs no Exchange and no network, and it doesn't create certificates or keys. It covers:
+- the inventory and validation of an installed certificate;
+- the mail flow checks;
+- Steps B and C, with snapshots and rollback;
+- the Auth certificate, including a failed `Get-AuthConfig`;
+- POP/IMAP restarts;
+- the Edge package;
+- unattended renewal, including `-ForceRenew`, which must not reuse the certificate already on IIS. It prints PASS/FAIL per check and exits with 1 if any check fails:
 
 ```powershell
 powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\tests\Test-ExchangeCertTool.ps1
