@@ -124,7 +124,7 @@ Exchange signs OAuth tokens with the self-signed *Microsoft Exchange Server Auth
 | A new certificate is already scheduled | Doesn't create another one. It copies the scheduled certificate to the selected servers that don't have it, and offers the Entra ID upload in hybrid. |
 | Expired, missing on a server, or less than 3 days left | Replaces it **now**. It creates and copies the new certificate as above, then runs `Set-AuthConfig -NewCertificateThumbprint … -NewCertificateEffectiveDate (Get-Date)`, `-PublishCertificate` and `-ClearPreviousCertificate`. Finally it restarts *MSExchangeServiceHost* and recycles the OWA and ECP app pools on each server through PowerShell remoting. |
 
-Select **all** Exchange servers on tab 1 first; the confirmation warns about servers that aren't selected. `Set-AuthConfig` is changed only after the new certificate is on every selected server, and the log contains the rollback command. In a **hybrid** deployment, the tool offers to upload the current and the next certificate to Entra ID right afterwards (see [Hybrid](#hybrid-exchange-online)). With a scheduled rotation this happens **before** the switch, so free/busy and MailTips keep working throughout. The inventory on tab 1 shows the scheduled certificate and its date. It warns if Exchange hasn't switched more than 12 hours after that date, and if the scheduled certificate is missing on a server. Tab 5 never removes the current, previous or next Auth certificate.
+Select **all** Exchange servers on tab 1 first; the confirmation warns about servers that aren't selected. `Set-AuthConfig` is changed only after the new certificate is on every selected server, and the log contains the rollback command. In a **hybrid** deployment, the tool offers to upload the current and the next certificate to Entra ID right afterwards (see [Hybrid](#hybrid-exchange-online)). With a scheduled rotation this happens **before** the switch, so free/busy and MailTips keep working throughout. The tool remembers the scheduled rotation in `%LOCALAPPDATA%\ExchangeCertTool\auth-rotation.json`. Once Exchange has switched, the inventory says so, and **Renew / copy Auth certificate...** offers the final step Microsoft recommends: recycling the OWA and ECP app pools on each server, without restarting services. The inventory on tab 1 shows the scheduled certificate and its date. It warns if Exchange hasn't switched more than 12 hours after that date, and if the scheduled certificate is missing on a server. Tab 5 never removes the current, previous or next Auth certificate.
 
 ## SMTP connectors (Default Frontend)
 
@@ -176,7 +176,13 @@ The script also removes expired certificates from the app. If your hybrid still 
 
 ## POP3 and IMAP4
 
-Tick *Also enable it for POP3 and IMAP4* on tab 3 only if clients use them. Step B then enables the certificate for POP and IMAP too. If `X509CertificateName` in `Get-PopSettings`/`Get-ImapSettings` is not a name on the new certificate, the tool sets it to the first non-wildcard name (the log contains the previous value). It restarts the running POP3 and IMAP4 services only when something changed: the name, or the certificate was just enabled for POP/IMAP. Tab 4 then checks ports 995 and 993.
+Tick *Also enable it for POP3 and IMAP4* on tab 3 only if clients use them. Step B then enables the certificate for POP and IMAP too. If `X509CertificateName` in `Get-PopSettings`/`Get-ImapSettings` is not a name on the new certificate, the tool changes it (the log contains the previous value). The name comes from the field **POP/IMAP host name** under the POP/IMAP option on tab 3. When you tick the option, the field is filled with a suggestion, which you can change. Suggestions are tried in this order:
+1. a host from the POP/IMAP `ExternalConnectionSettings` / `InternalConnectionSettings` that is on the certificate;
+2. the current name, if it is on the certificate;
+3. the first name on the certificate that isn't a wildcard;
+4. for wildcard-only certificates with none of the above, `mail.<domain>`, with a warning.
+
+Step B refuses a name typed there that isn't on the certificate, before it changes anything. It restarts the running POP3 and IMAP4 services only when something changed: the name, or the certificate was just enabled for POP/IMAP. Tab 4 then checks ports 995 and 993.
 
 ## Mail flow checks
 
@@ -301,22 +307,23 @@ Posh-ACME keeps the account, the orders and the issued files in `%LOCALAPPDATA%\
 **One-time setup**
 
 1. In the GUI, as the Windows user that will run the task, request a certificate from a **production** CA with **HTTP-01**, **Cloudflare** or a **DNS plugin** (DNS-01 manual can't run unattended), with **all** mailbox servers selected. For Cloudflare, tick **Remember the token**. When the certificate is issued, the tool saves the settings to `%LOCALAPPDATA%\ExchangeCertTool\renewal.json`: CA, names, challenge type, key length, e-mail and servers. Plugin arguments are encrypted with DPAPI.
-2. Try it in dry run, which logs what it would do and changes nothing:
+2. On tab 1b, under **Automatic renewal (scheduled task)**, set the daily time, an optional e-mail address for the report and, if you want it, **Remove the old certificate**. Click **Create renewal task...**.
+   - Windows asks for **your** password. The task must run as the same user as step 1, because the Posh-ACME account, the Cloudflare token and the settings are stored in that user's profile and encrypted for that user.
+   - The password goes to Task Scheduler only. The tool never logs or saves it.
+   - The task *ExchangeCertTool renewal* runs daily, whether you're logged on or not, with highest privileges: `powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "<this script>" -Renew -Live [-RemoveOld] [-NotifyTo …] -LogDirectory "<logs>"`.
+   - A daily run is fine: it ends at once while the current certificate has more than `-RenewDays` (30) days left.
+3. Click **Test the task...**. The tool registers a temporary copy of the task **without `-Live`** and with `-ForceRenew`, starts it through Task Scheduler and waits until it finishes. It then shows the run's log and exit code on screen and deletes the temporary task. Nothing is requested from the CA and nothing changes in Exchange.
 
-   ```powershell
-   powershell.exe -STA -ExecutionPolicy Bypass -File .\ExchangeCertTool.ps1 -Renew -ForceRenew
-   ```
+   This proves the task can start the script, load the Exchange cmdlets and read the renewal settings and secrets in the task's own context. That context is where scheduled scripts usually fail.
 
-3. Create the scheduled task. It must run as the **same user** as step 1, because the Posh-ACME account, the Cloudflare token and the settings are stored in that user's profile, encrypted for that user:
+To create the task by hand instead:
 
-   ```powershell
-   $cred    = Get-Credential 'CONTOSO\svc-exchcert'
-   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -STA -ExecutionPolicy Bypass -File "C:\Scripts\ExchangeCertTool.ps1" -Renew -Live -RemoveOld -NotifyTo admin@contoso.com'
-   $trigger = New-ScheduledTaskTrigger -Daily -At 3am
-   Register-ScheduledTask -TaskName 'Exchange certificate renewal' -Action $action -Trigger $trigger -RunLevel Highest -User $cred.UserName -Password $cred.GetNetworkCredential().Password
-   ```
-
-   A daily run is fine: it ends at once while the current certificate has more than `-RenewDays` (30) days left.
+```powershell
+$cred    = Get-Credential "$env:USERDOMAIN\$env:USERNAME"
+$action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -STA -ExecutionPolicy Bypass -File "C:\Scripts\ExchangeCertTool.ps1" -Renew -Live -RemoveOld -NotifyTo admin@contoso.com'
+$trigger = New-ScheduledTaskTrigger -Daily -At 3am
+Register-ScheduledTask -TaskName 'ExchangeCertTool renewal' -Action $action -Trigger $trigger -RunLevel Highest -User $cred.UserName -Password $cred.GetNetworkCredential().Password
+```
 
 **What a run does**
 
@@ -344,8 +351,7 @@ Without `-Live`, the run is a dry run: it stops before the ACME request (or, if 
 ## Known limitations
 
 - **Rollback** needs the old certificate to be still installed. Snapshots from older versions of the tool don't record self-signed IIS certificates or empty POP/IMAP names, so those aren't restored from them.
-- **POP/IMAP with a wildcard-only certificate**: the name is set to `mail.<domain>`. Check that this name exists in DNS, or set `X509CertificateName` yourself.
-- **`-Renew` from a scheduled task** is tested against mock cmdlets only. Before relying on it, do one dry run from the task itself, as the task's user.
+- **`-Renew` and the renewal task** are tested here against mocked Exchange and Task Scheduler cmdlets. On your server, **Test the task...** does one real dry run through Task Scheduler. Use it before relying on the task, and again after changing the account's password.
 - **Exchange Online** (Step D, Auth upload) needs an interactive sign-in, so unattended `-Renew` can't change anything there. Step D has been tested against mocked Exchange Online cmdlets only. The Auth upload is done by Microsoft's script, which the tool only starts.
 - **HAProxy** is handled through a package that you copy and run yourself; the tool doesn't connect to it. Other load balancers (F5, KEMP, NGINX) need the certificate installed by hand.
 - **Edge Transport, Exchange 2013 and older**: not managed directly (see above).
@@ -359,7 +365,9 @@ Without `-Live`, the run is a dry run: it stops before the ACME request (or, if 
 - completing a CSR by public key when the same name was requested on two servers;
 - the Auth certificate, including a failed `Get-AuthConfig`, and the upload to Entra ID (public `.cer` export, the signature check, the new window; with mocks, not Microsoft's script);
 - Step D: which Exchange Online connectors match by name, which are changed or left alone, and rollback;
-- POP/IMAP restarts;
+- POP/IMAP restarts and the choice of the POP/IMAP host name;
+- the renewal task: the registered command, user and password handling, and the test run (with Task Scheduler mocked);
+- the follow-up after Exchange switches to the scheduled Auth certificate;
 - the Edge package;
 - the HAProxy package: the script runs for real with bash and `openssl` against a throwaway PFX (check only, install, backup, failed `haproxy -c`, wrong PFX, `haproxy` missing). It is skipped if Git for Windows isn't installed;
 - unattended renewal, including `-ForceRenew`, which must not reuse the certificate already on IIS. It prints PASS/FAIL per check and exits with 1 if any check fails:

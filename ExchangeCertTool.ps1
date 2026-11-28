@@ -83,6 +83,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if (-not $LogDirectory) { $LogDirectory = Join-Path $PSScriptRoot 'logs' }
+$script:ToolPath = $PSCommandPath   # the scheduled renewal task runs this file
 
 if ($PSVersionTable.PSEdition -eq 'Core') {
     throw 'Run this tool in Windows PowerShell 5.1 (powershell.exe), not PowerShell 7 - the Exchange cmdlets and WPF host require it.'
@@ -567,6 +568,11 @@ function Test-AuthCertificate {
         }
         else { Write-Log ('Next Auth certificate {0} is scheduled: Exchange makes it current by itself on {1}.' -f $next, $(if ($nextDate) { $nextDate.ToString('yyyy-MM-dd HH:mm') } else { '(no date)' })) }
         if ($nextMissing) { Write-Log "The next Auth certificate $next is missing on $($nextMissing -join ', '): copy it before the switch. $fix" WARN }
+    }
+    $rot = Get-AuthRotationState
+    if ($rot) {
+        if ("$($rot.NewThumb)" -eq $thumb) { Write-Log "Exchange has switched to the scheduled Auth certificate $thumb. Recycle the OWA and ECP app pools on each server: click ""Renew / copy Auth certificate"" on tab 1 (it offers it)." WARN }
+        elseif ("$($rot.NewThumb)" -ne $next) { Clear-AuthRotationState; Write-Log "The remembered Auth rotation to $($rot.NewThumb) is neither current nor next any more - forgotten." }
     }
 }
 
@@ -1316,6 +1322,8 @@ function Invoke-EnableCertificate {
     $replaceInternal = [bool]$script:ui.ReplaceInternalCheck.IsChecked
     $popImap = [bool]$script:ui.PopImapCheck.IsChecked
     $services = @('IIS', 'SMTP') + @(if ($popImap) { 'POP', 'IMAP' })
+    # A POP/IMAP name entered on tab 3 must be on the certificate - checked before anything changes.
+    if ($popImap -and $script:ui.PopImapNameBox -and $script:ui.PopImapNameBox.Text.Trim()) { $null = Get-PopImapTarget -Server $servers[0] }
 
     if (-not (Test-DryRun)) {
         $notImported = @($servers | Where-Object { -not (Get-ExchangeCertSafe -Server $_ -Thumbprint $thumb) })
@@ -1369,18 +1377,56 @@ function Invoke-EnableCertificate {
 }
 
 # POP3/IMAP4 pick their certificate by X509CertificateName: point it at a name on the new certificate, then restart.
+# Host names POP/IMAP clients are told to use on a server (ExternalConnectionSettings / InternalConnectionSettings,
+# e.g. "mail.contoso.com:995:SSL"). Live objects have .Hostname, deserialized ones are strings.
+function Get-PopImapHosts {
+    param([string]$Server)
+    $hosts = foreach ($kind in 'Pop', 'Imap') {
+        try { $st = & "Get-${kind}Settings" -Server $Server -ErrorAction Stop } catch { continue }
+        foreach ($cs in @(@($st.ExternalConnectionSettings) + @($st.InternalConnectionSettings))) {
+            if (-not $cs) { continue }
+            $h = if ($cs.PSObject.Properties['Hostname'] -and "$($cs.Hostname)") { "$($cs.Hostname)" } else { ("$cs" -split ':')[0] }
+            if ($h.Trim()) { $h.Trim().ToLowerInvariant() }
+        }
+    }
+    @($hosts | Select-Object -Unique)
+}
+
+# The X509CertificateName for POP/IMAP: the name entered on tab 3; else a host from the POP/IMAP connection
+# settings that is on the certificate; else the current name if it is on the certificate; else the first
+# non-wildcard name; else mail.<domain> from a wildcard (warned - enter the real name on tab 3).
+function Get-PopImapTarget {
+    param([string]$Server, [string]$Current)
+    $names = @($script:State.NewNames)
+    $typed = if ($script:ui -and $script:ui.PopImapNameBox) { $script:ui.PopImapNameBox.Text.Trim().ToLowerInvariant() } else { '' }
+    if ($typed) {
+        if ($typed -match '\*') { throw "POP/IMAP name '$typed': enter the host name clients use, not a wildcard." }
+        if (-not (Test-HostCovered -HostName $typed -CertNames $names)) { throw "POP/IMAP name '$typed' is not on the new certificate ($($names -join ', '))." }
+        return [pscustomobject]@{ Name = $typed; Source = 'entered on tab 3' }
+    }
+    foreach ($h in @(Get-PopImapHosts -Server $Server)) {
+        if (Test-HostCovered -HostName $h -CertNames $names) { return [pscustomobject]@{ Name = $h; Source = 'POP/IMAP connection settings' } }
+    }
+    if ($Current -and (Test-HostCovered -HostName $Current -CertNames $names)) { return [pscustomobject]@{ Name = $Current.ToLowerInvariant(); Source = 'current setting' } }
+    $plain = @($names | Where-Object { $_ -notmatch '\*' } | Select-Object -First 1)[0]
+    if ($plain) { return [pscustomobject]@{ Name = "$plain".ToLowerInvariant(); Source = 'first name on the certificate' } }
+    $guess = ("$(@($names)[0])" -replace '^\*\.', 'mail.').ToLowerInvariant()
+    Write-Log "POP/IMAP on ${Server}: the certificate has only wildcard names and no POP/IMAP connection setting names a host - using $guess. If clients use another name, enter it on tab 3." WARN
+    [pscustomobject]@{ Name = $guess; Source = 'guessed from the wildcard' }
+}
+
 function Set-PopImapCertificateName {
     param([string]$Server, [bool]$ServicesChanged = $true)   # ServicesChanged: the new certificate was just enabled for POP/IMAP
     $names = @($script:State.NewNames)
-    $target = @($names | Where-Object { $_ -notmatch '\*' } | Select-Object -First 1)[0]
-    if (-not $target) { $target = ($names | Select-Object -First 1) -replace '^\*\.', 'mail.' }
     $changed = $false
     foreach ($kind in 'Pop', 'Imap') {
         try { $cur = "$((& "Get-${kind}Settings" -Server $Server -ErrorAction Stop).X509CertificateName)" }
         catch { Write-Log "${Server}: Get-${kind}Settings failed: $($_.Exception.Message)" WARN; continue }
-        if ($cur -and (Test-HostCovered -HostName $cur -CertNames $names)) { Write-Log "${Server}: ${kind} X509CertificateName $cur is on the new certificate." OK; continue }
+        $t = Get-PopImapTarget -Server $Server -Current $cur
+        $keep = $cur -and (($cur.ToLowerInvariant() -eq $t.Name) -or ($t.Source -ne 'entered on tab 3' -and (Test-HostCovered -HostName $cur -CertNames $names)))
+        if ($keep) { Write-Log "${Server}: ${kind} X509CertificateName $cur is on the new certificate." OK; continue }
         Write-Log "Rollback for ${Server} ${kind}: Set-${kind}Settings -Server $Server -X509CertificateName $(if ($cur) { $cur } else { '$null' })"
-        Invoke-Step "Set-${kind}Settings -Server $Server -X509CertificateName $target" { & "Set-${kind}Settings" -Server $Server -X509CertificateName $target -ErrorAction Stop }
+        Invoke-Step "Set-${kind}Settings -Server $Server -X509CertificateName $($t.Name)   ($($t.Source))" { & "Set-${kind}Settings" -Server $Server -X509CertificateName $t.Name -ErrorAction Stop }
         $changed = $true
     }
     if (-not $changed -and -not $ServicesChanged) {
@@ -1567,6 +1613,18 @@ function Invoke-AuthCertificate {
         throw 'Get-AuthConfig did not answer (see the log), so the current Auth certificate is unknown. Nothing was changed. Check the Exchange connection and try again.'
     }
     $thumb = $script:State.AuthThumb
+    # Follow-up of a scheduled rotation: Exchange has switched -> recycle the OWA/ECP app pools (Microsoft's last step).
+    $rot = Get-AuthRotationState
+    if ($rot -and $thumb -and "$($rot.NewThumb)" -eq $thumb) {
+        $msg = "Exchange has made the scheduled Auth certificate $thumb current.`n`nRecycle the OWA and ECP app pools now on: $($servers -join ', ')?`n`n" +
+        'They cache the Auth certificate (Microsoft recommends the recycle after the switch). OWA/ECP users may have to sign in again.'
+        if (@($rot.Servers | Where-Object { $_ -notin $servers })) { $msg += "`n`nNot selected on tab 1, but part of the rotation: $(@($rot.Servers | Where-Object { $_ -notin $servers }) -join ', ')." }
+        if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+        if (-not (Confirm-Action $msg 'Auth certificate switched: recycle app pools')) { Write-Log 'Cancelled - the app pools were not recycled.' WARN; return }
+        $failed = Invoke-OwaEcpRecycle -Servers $servers
+        if (-not (Test-DryRun) -and $failed -eq 0) { Clear-AuthRotationState; Write-Log "Auth certificate rotation to $thumb completed." OK }
+        return
+    }
     $have = @($script:State.Inventory | Where-Object { $thumb -and $_.Thumbprint -eq $thumb })
     $missing = @($servers | Where-Object { $_ -notin @($have | ForEach-Object { $_.Server }) })
     $days = if ($have) { ($have | Measure-Object DaysLeft -Minimum).Minimum } else { -1 }
@@ -1591,6 +1649,7 @@ function Invoke-AuthCertificate {
     $next = "$($script:State.AuthNextThumb)"; $nextDate = $script:State.AuthNextDate
     if ($next -and $next -ne $thumb -and $nextDate -and $nextDate -gt (Get-Date)) {
         Write-Log ('A new Auth certificate {0} is already scheduled: Exchange makes it current by itself on {1:yyyy-MM-dd HH:mm}. No new certificate is created.' -f $next, $nextDate) OK
+        if (-not (Test-DryRun) -and "$((Get-AuthRotationState).NewThumb)" -ne $next) { Save-AuthRotationState -NewThumb $next -OldThumb $thumb -Effective $nextDate -Servers $servers }
         $nextMissing = @($servers | Where-Object { -not (Get-ExchangeCertSafe -Server $_ -Thumbprint $next) })
         if ($nextMissing) {
             $msg = "Copy the scheduled Auth certificate $next to: $($nextMissing -join ', ')?`n`nIt must be on every server before $($nextDate.ToString('yyyy-MM-dd HH:mm'))."
@@ -1659,7 +1718,8 @@ function Invoke-AuthCertificate {
         $ac = Get-AuthConfig
         if ("$($ac.NextCertificateThumbprint)" -eq $newThumb -and "$($ac.CurrentCertificateThumbprint)" -eq $thumb) {
             Write-Log ('Scheduled: {0} becomes the current Auth certificate on {1:yyyy-MM-dd HH:mm}; until then {2} stays current. The AuthAdmin servicelet switches within 12 hours after that time (Application log: MSExchange AuthAdmin, event 2014).' -f $newThumb, $effective, $thumb) OK
-            Write-Log 'After the switch, recycle the OWA and ECP app pools on each server (Restart-WebAppPool MSExchangeOWAAppPool; Restart-WebAppPool MSExchangeECPAppPool). The inventory on tab 1 warns if the switch did not happen.'
+            Save-AuthRotationState -NewThumb $newThumb -OldThumb $thumb -Effective $effective -Servers $servers
+            Write-Log 'After the switch, the inventory on tab 1 says so and "Renew / copy Auth certificate" offers to recycle the OWA and ECP app pools (Microsoft recommends it). It also warns if the switch did not happen.'
         }
         else { Write-Log "Get-AuthConfig shows current $($ac.CurrentCertificateThumbprint) / next $($ac.NextCertificateThumbprint), expected current $thumb / next $newThumb - check it manually." ERROR }
         Update-Inventory
@@ -1678,22 +1738,56 @@ function Invoke-AuthCertificate {
     $now = "$((Get-AuthConfig).CurrentCertificateThumbprint)"
     if ($now -eq $newThumb) { Write-Log "The Auth certificate is now $newThumb." OK } else { Write-Log "Get-AuthConfig shows $now, expected $newThumb - check it manually." ERROR }
 
-    foreach ($s in $servers) {
+    $null = Invoke-OwaEcpRecycle -Servers $servers -RestartServiceHost
+    Clear-AuthRotationState
+    Update-Inventory
+    if ($hybrid) { & $offerUpload 'now' }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Auth rotation follow-up: a scheduled rotation is remembered, so the tool can offer the OWA/ECP app pool
+# recycle that Microsoft recommends once Exchange has switched (the app pools cache the Auth certificate).
+# ---------------------------------------------------------------------------------------------
+$script:AuthRotationFile = Join-Path $env:LOCALAPPDATA 'ExchangeCertTool\auth-rotation.json'
+
+function Save-AuthRotationState {
+    param([string]$NewThumb, [string]$OldThumb, $Effective, [string[]]$Servers)
+    $dir = Split-Path $script:AuthRotationFile
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [ordered]@{ NewThumb = $NewThumb; OldThumb = $OldThumb; Effective = $(if ($Effective) { ([datetime]$Effective).ToString('s') } else { '' }); Servers = @($Servers); Saved = (Get-Date).ToString('s') } |
+        ConvertTo-Json | Set-Content -LiteralPath $script:AuthRotationFile -Encoding UTF8
+}
+
+function Get-AuthRotationState {
+    if (-not (Test-Path -LiteralPath $script:AuthRotationFile)) { return $null }
+    try { Get-Content -LiteralPath $script:AuthRotationFile -Raw | ConvertFrom-Json } catch { $null }
+}
+
+function Clear-AuthRotationState { Remove-Item -LiteralPath $script:AuthRotationFile -Force -ErrorAction SilentlyContinue }
+
+# Recycles the OWA and ECP app pools (and optionally restarts MSExchangeServiceHost) on each server. Returns the number of failures.
+function Invoke-OwaEcpRecycle {
+    param([string[]]$Servers, [switch]$RestartServiceHost)
+    $failed = 0
+    foreach ($s in $Servers) {
         $fqdn = Get-ServerFqdn $s
         try {
-            Invoke-Step "Invoke-Command -ComputerName $fqdn { Restart-Service MSExchangeServiceHost; recycle MSExchangeOWAAppPool, MSExchangeECPAppPool }" {
-                Invoke-Command -ComputerName $fqdn -ErrorAction Stop -ScriptBlock {
-                    Restart-Service -Name MSExchangeServiceHost -Force -ErrorAction Stop
+            Invoke-Step "Invoke-Command -ComputerName $fqdn { $(if ($RestartServiceHost) { 'Restart-Service MSExchangeServiceHost; ' })recycle MSExchangeOWAAppPool, MSExchangeECPAppPool }" {
+                Invoke-Command -ComputerName $fqdn -ErrorAction Stop -ArgumentList ([bool]$RestartServiceHost) -ScriptBlock {
+                    param($restartHost)
+                    if ($restartHost) { Restart-Service -Name MSExchangeServiceHost -Force -ErrorAction Stop }
                     Import-Module WebAdministration -ErrorAction Stop
                     foreach ($pool in 'MSExchangeOWAAppPool', 'MSExchangeECPAppPool') { try { Restart-WebAppPool -Name $pool -ErrorAction Stop } catch { Start-WebAppPool -Name $pool -ErrorAction Stop } }
                 }
-                Write-Log "${s}: MSExchangeServiceHost restarted, OWA/ECP app pools recycled." OK
+                Write-Log "${s}: $(if ($RestartServiceHost) { 'MSExchangeServiceHost restarted, ' })OWA/ECP app pools recycled." OK
             }
         }
-        catch { Write-Log "${s}: restart failed ($($_.Exception.Message)). On the server run: Restart-Service MSExchangeServiceHost; Restart-WebAppPool MSExchangeOWAAppPool; Restart-WebAppPool MSExchangeECPAppPool" WARN }
+        catch {
+            $failed++
+            Write-Log "${s}: restart failed ($($_.Exception.Message)). On the server run: $(if ($RestartServiceHost) { 'Restart-Service MSExchangeServiceHost; ' })Restart-WebAppPool MSExchangeOWAAppPool; Restart-WebAppPool MSExchangeECPAppPool" WARN
+        }
     }
-    Update-Inventory
-    if ($hybrid) { & $offerUpload 'now' }
+    $failed
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -3394,7 +3488,10 @@ function Get-RenewalBlockers {
 
 function Send-RenewalReport {
     param([string]$Result)
-    if (-not $NotifyTo) { return }
+    # From a scheduled task "-NotifyTo a@x,b@y" arrives as one string: split it.
+    $to = @($NotifyTo | ForEach-Object { "$_" -split '[,;\s]+' } | Where-Object { $_ })
+    if (-not $to) { return }
+    $NotifyTo = $to
     $from = $NotifyFrom
     if (-not $from) {
         try { $d = "$((Get-AcceptedDomain | Where-Object { $_.Default } | Select-Object -First 1).DomainName)"; if ($d) { $from = "ExchangeCertTool@$d" } } catch { }
@@ -3406,6 +3503,118 @@ function Send-RenewalReport {
         Write-Log "Report sent to $($NotifyTo -join ', ') via $SmtpServer." OK
     }
     catch { Write-Log "Could not send the report to $($NotifyTo -join ', ') via ${SmtpServer}: $($_.Exception.Message)" ERROR }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Scheduled task for -Renew - tab 1b. Runs as the current user: renewal.json, the Posh-ACME account and the
+# Cloudflare token are stored in this user's profile and encrypted for this user. The password goes to Task
+# Scheduler only (needed to run whether the user is logged on or not, with network access to the other servers).
+# ---------------------------------------------------------------------------------------------
+$script:RenewTaskName = 'ExchangeCertTool renewal'
+
+function Get-RenewTaskArguments {
+    param([switch]$Live, [switch]$ForceRenew, [switch]$RemoveOld, [string[]]$NotifyTo, [string]$LogDir)
+    $a = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$script:ToolPath`"", '-Renew')
+    if ($Live) { $a += '-Live' }
+    if ($ForceRenew) { $a += '-ForceRenew' }
+    if ($RemoveOld) { $a += '-RemoveOld' }
+    if (@($NotifyTo).Count) { $a += '-NotifyTo'; $a += (@($NotifyTo) -join ',') }
+    if ($LogDir) { $a += '-LogDirectory'; $a += "`"$LogDir`"" }
+    $a -join ' '
+}
+
+function Get-RenewTaskOptions {
+    $time = $script:ui.LeTaskTimeBox.Text.Trim()
+    $at = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($time, 'HH:mm', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$at)) { throw "Time '$time' is not HH:mm (for example 03:00)." }
+    $mails = @($script:ui.LeTaskNotifyBox.Text -split '[,;\s]+' | Where-Object { $_ })
+    foreach ($m in $mails) { if ($m -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw "'$m' is not an e-mail address." } }
+    [pscustomobject]@{ At = $at; NotifyTo = $mails; RemoveOld = [bool]$script:ui.LeTaskRemoveOldCheck.IsChecked }
+}
+
+function Get-RenewTaskCredential {
+    if ($script:RenewTaskCred) { return $script:RenewTaskCred }   # kept in memory for this session only
+    $me = "$env:USERDOMAIN\$env:USERNAME"
+    $c = Get-Credential -UserName $me -Message "Password of $me for the scheduled task. It must run as this user (the renewal settings are encrypted for it). The password goes to Windows Task Scheduler only - this tool never logs or saves it."
+    if (-not $c) { throw 'Cancelled - no password entered.' }
+    $u = "$($c.UserName)"; if ($u -notmatch '\\') { $u = "$env:USERDOMAIN\$u" }
+    if ($u -ne $me) { throw "The task must run as $me (the user that saved the renewal settings), not $u." }
+    $script:RenewTaskCred = $c
+    $c
+}
+
+function Register-RenewTask {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Arguments, $At, [string]$Description)
+    $cred = Get-RenewTaskCredential
+    $me = "$env:USERDOMAIN\$env:USERNAME"
+    $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument $Arguments -WorkingDirectory (Split-Path $script:ToolPath)
+    $set = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2) -MultipleInstances IgnoreNew
+    $p = @{ TaskName = $Name; Action = $action; Settings = $set; RunLevel = 'Highest'; User = $me; Password = $cred.GetNetworkCredential().Password; Description = $Description; Force = $true; ErrorAction = 'Stop' }
+    if ($At) { $p.Trigger = New-ScheduledTaskTrigger -Daily -At $At }
+    try { Register-ScheduledTask @p | Out-Null }
+    catch { if ("$($_.Exception.Message)" -match 'password|logon|user name') { $script:RenewTaskCred = $null }; throw }
+    finally { $p.Password = $null }
+}
+
+function New-RenewTask {
+    $settings = Get-RenewalProfile
+    $o = Get-RenewTaskOptions
+    $taskArgs = Get-RenewTaskArguments -Live -RemoveOld:$o.RemoveOld -NotifyTo $o.NotifyTo -LogDir (Split-Path $script:LogFile)
+    $me = "$env:USERDOMAIN\$env:USERNAME"
+    $existing = Get-ScheduledTask -TaskName $script:RenewTaskName -ErrorAction SilentlyContinue
+    $msg = "$(if ($existing) { 'Replace' } else { 'Create' }) the scheduled task '$($script:RenewTaskName)'?`n`n" +
+    "  When: daily at $($o.At.ToString('HH:mm')), whether $me is logged on or not, highest privileges`n" +
+    "  Program: $(Join-Path $PSHOME 'powershell.exe')`n  Arguments: $taskArgs`n`n" +
+    "It renews when the IIS certificate has fewer than 30 days left, with the settings saved on $($settings.Saved) ($(@($settings.Names) -join ', '); servers $(@($settings.Servers) -join ', ')). Windows asks for the password of $me next.`n`nAfterwards click 'Test the task'."
+    if (Test-DryRun) { $msg += "`n`n(DRY RUN - nothing will be changed)" }
+    if (-not (Confirm-Action $msg 'Scheduled renewal task')) { Write-Log 'Cancelled.' WARN; return }
+    $desc = 'Renews the Exchange certificate (ExchangeCertTool -Renew). Created by ExchangeCertTool.'
+    Invoke-Step "Register-ScheduledTask -TaskName '$($script:RenewTaskName)' -User $me -Password <asked, not logged> -RunLevel Highest -Trigger (daily $($o.At.ToString('HH:mm'))) -Action powershell.exe $taskArgs" {
+        Register-RenewTask -Name $script:RenewTaskName -Arguments $taskArgs -At $o.At -Description $desc
+        Write-Log "Scheduled task '$($script:RenewTaskName)' $(if ($existing) { 'replaced' } else { 'created' }). Run 'Test the task' once to prove it works in the task's context." OK
+    }
+}
+
+# One-off DRY RUN of the renewal through Task Scheduler (same user, same command without -Live, plus -ForceRenew):
+# proves the task can start the script, load Exchange, read the renewal settings and secrets - changes nothing.
+function Test-RenewTask {
+    $null = Get-RenewalProfile
+    $name = "$($script:RenewTaskName) (test)"
+    $logDir = Split-Path $script:LogFile
+    $taskArgs = Get-RenewTaskArguments -ForceRenew -LogDir $logDir
+    $me = "$env:USERDOMAIN\$env:USERNAME"
+    $msg = "Test the renewal as a scheduled task now?`n`nThe tool registers a temporary task '$name' as $me (password asked), starts it, waits up to 10 minutes, shows its log here and deletes the temporary task.`n`n  Arguments: $taskArgs`n`n" +
+    'It runs WITHOUT -Live: nothing is requested from the CA and nothing changes in Exchange (this also works with Dry run on). -ForceRenew makes it go through the steps even when the certificate is not due.'
+    if (-not (Confirm-Action $msg 'Test the renewal task')) { Write-Log 'Cancelled.' WARN; return }
+    $start = (Get-Date).AddSeconds(-2)
+    Write-Log "Register-ScheduledTask -TaskName '$name' -User $me -Password <not logged> (no trigger); Start-ScheduledTask" CMD
+    Register-RenewTask -Name $name -Arguments $taskArgs -Description 'Temporary test of the ExchangeCertTool renewal task (dry run).'
+    try {
+        Start-ScheduledTask -TaskName $name -ErrorAction Stop
+        Write-Log "Started '$name' - waiting for it to finish (up to 10 minutes)..."
+        $deadline = (Get-Date).AddMinutes(10); $info = $null
+        do {
+            Wait-Ui 3
+            $info = Get-ScheduledTaskInfo -TaskName $name -ErrorAction Stop
+            $state = "$((Get-ScheduledTask -TaskName $name -ErrorAction Stop).State)"
+            $done = $info.LastRunTime -and ([datetime]$info.LastRunTime -ge $start) -and $state -notin 'Running', 'Queued'
+        } until ($done -or (Get-Date) -gt $deadline)
+        if (-not $done) { try { Stop-ScheduledTask -TaskName $name -ErrorAction Stop } catch { }; Write-Log 'The test task did not finish within 10 minutes - stopped.' ERROR }
+        $code = [int64]$info.LastTaskResult
+        $log = Get-ChildItem -LiteralPath $logDir -Filter 'CertRenew_*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $start } | Sort-Object LastWriteTime | Select-Object -Last 1
+        if ($log) {
+            Write-Log "--- Log of the test run: $($log.FullName) ---"
+            foreach ($l in @(Get-Content -LiteralPath $log.FullName -Tail 40)) { Write-Log "  | $l" }
+            Write-Log '--- end of the test run log ---'
+        }
+        else { Write-Log "The test run wrote no log to $logDir - the task could not start the script (check the path, that $me may log on as a batch job, and the execution policy)." ERROR }
+        if ($done -and $code -eq 0 -and $log) { Write-Log "Test passed: the scheduled task runs as $me, loads Exchange and the renewal settings (exit code 0). The real task runs the same command with -Live." OK }
+        elseif ($done) { Write-Log ('Test FAILED: exit code {0} (0x{0:X}). See the log above.' -f $code) ERROR }
+    }
+    finally {
+        try { Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop; Write-Log "Temporary task '$name' deleted." }
+        catch { Write-Log "Could not delete the temporary task '$name': $($_.Exception.Message) - delete it in Task Scheduler." WARN }
+    }
 }
 
 # Runs the GUI steps without the GUI. Sets $script:RenewExitCode: 0 = done or nothing to do, 1 = failed.
@@ -3633,6 +3842,20 @@ function Invoke-UnattendedRenewal {
               <TextBlock Margin="20,2,0,2" TextWrapping="Wrap" Foreground="DimGray"
                          Text="Plugin arguments, one per line as Name=Value. Prefix secrets with secure: (CFToken=secure:abc123). Lists as [a,b]. Values are never logged or saved."/>
               <TextBox x:Name="LePluginArgsBox" Margin="20,0,0,0" Height="70" AcceptsReturn="True" FontFamily="Consolas" VerticalScrollBarVisibility="Auto"/>
+              <TextBlock Margin="0,16,0,2" FontWeight="Bold" Text="Automatic renewal (scheduled task)"/>
+              <TextBlock TextWrapping="Wrap" Foreground="DimGray"
+                         Text="After a certificate was issued here (HTTP-01, Cloudflare or a DNS plugin), a daily task can renew it with -Renew -Live. It runs as you, because the renewal settings are encrypted for your user. 'Test the task' runs it once through Task Scheduler without -Live (changes nothing) and shows its log."/>
+              <DockPanel Margin="0,6,0,0">
+                <TextBlock DockPanel.Dock="Left" VerticalAlignment="Center" Text="Daily at (HH:mm):" Margin="0,0,6,0"/>
+                <TextBox x:Name="LeTaskTimeBox" Width="60" Text="03:00" HorizontalAlignment="Left"/>
+              </DockPanel>
+              <TextBlock Margin="0,6,0,2" Text="E-mail the log after a renewal or failure to (optional, comma-separated):"/>
+              <TextBox x:Name="LeTaskNotifyBox"/>
+              <CheckBox x:Name="LeTaskRemoveOldCheck" Margin="0,6,0,0" Content="Remove the old certificate after every server passed verification (-RemoveOld)"/>
+              <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                <Button x:Name="LeTaskCreateButton" Content="Create renewal task..."/>
+                <Button x:Name="LeTaskTestButton" Content="Test the task..."/>
+              </StackPanel>
             </StackPanel>
           </ScrollViewer>
           </DockPanel>
@@ -3680,6 +3903,11 @@ function Invoke-UnattendedRenewal {
           <CheckBox x:Name="ExportableCheck" Margin="0,14,0,0" Content="Mark private key as exportable on the servers (only if you need to export it from Exchange later)"/>
           <CheckBox x:Name="ReplaceInternalCheck" Margin="0,6,0,0" Content="Also replace the internal transport (default SMTP) certificate - normally leave unchecked"/>
           <CheckBox x:Name="PopImapCheck" Margin="0,6,0,0" Content="Also enable it for POP3 and IMAP4 (only if clients use them: sets X509CertificateName if needed and restarts the POP/IMAP services)"/>
+          <DockPanel Margin="20,4,0,0">
+            <TextBlock DockPanel.Dock="Left" VerticalAlignment="Center" Margin="0,0,8,0" Text="POP/IMAP host name (X509CertificateName):"/>
+            <TextBox x:Name="PopImapNameBox" Width="280" HorizontalAlignment="Left"
+                     ToolTip="The name POP/IMAP clients connect to. Filled in when you tick POP/IMAP (from the POP/IMAP connection settings, the current setting or the certificate). Empty = chosen automatically. Must be on the new certificate."/>
+          </DockPanel>
           <StackPanel Orientation="Horizontal" Margin="0,18,0,0">
             <Button x:Name="ImportButton" Content="Step A: Import PFX to selected servers"/>
             <Button x:Name="EnableButton" Content="Step B: Enable for IIS + SMTP"/>
@@ -3767,7 +3995,7 @@ function New-MainWindow {
 }
 
 $script:ActionButtons = 'ReloadServersButton', 'RefreshButton', 'BrowseButton', 'ValidateButton', 'LoadAcmeButton', 'UseInstalledButton', 'RefreshInstalledButton', 'ImportButton', 'EnableButton', 'ConnectorPreviewButton', 'ConnectorUpdateButton', 'VerifyButton', 'LoadOldButton', 'RemoveButton',
-'AuthRenewButton', 'CsrCreateButton', 'CsrCompleteButton', 'RollbackButton', 'EdgePackageButton', 'HaproxyPackageButton', 'AuthUploadButton', 'ExoCheckButton', 'ExoUpdateButton', 'RestartButton',
+'AuthRenewButton', 'CsrCreateButton', 'CsrCompleteButton', 'RollbackButton', 'EdgePackageButton', 'HaproxyPackageButton', 'AuthUploadButton', 'ExoCheckButton', 'ExoUpdateButton', 'LeTaskCreateButton', 'LeTaskTestButton', 'RestartButton',
 'LeInstallModuleButton', 'LeRecheckModuleButton', 'LeZeroSslEabButton', 'LeCfTestButton', 'LeFillCertButton', 'LeFillNamesButton', 'LePluginParamsButton', 'LeTestHttpButton', 'LeRequestButton', 'LeCheckDnsButton', 'LeContinueButton', 'LeCleanupButton'
 
 function Invoke-UiAction {
@@ -3826,6 +4054,21 @@ function Register-UiEvents {
     $ui.AuthUploadButton.Add_Click({ Invoke-UiAction 'Upload Auth certificate' { Invoke-UploadAuthToEntra } })
     $ui.ExoCheckButton.Add_Click({ Invoke-UiAction 'Exchange Online connectors' { [void](Get-ExoConnectorPlanLive) } })
     $ui.ExoUpdateButton.Add_Click({ Invoke-UiAction 'Step D' { Invoke-UpdateExoConnectors } })
+    $ui.LeTaskCreateButton.Add_Click({ Invoke-UiAction 'Renewal task' { New-RenewTask } })
+    $ui.LeTaskTestButton.Add_Click({ Invoke-UiAction 'Test renewal task' { Test-RenewTask } })
+    $ui.PopImapCheck.Add_Checked({
+            # Suggest the POP/IMAP host name (only when nothing was typed yet and a certificate is validated)
+            if ($script:ui.PopImapNameBox.Text.Trim() -or -not $script:State.Validated -or -not (Test-ExchangeAvailable)) { return }
+            try {
+                $srv = @(Get-SelectedServers)[0]
+                if (-not $srv) { return }
+                $cur = "$((Get-PopSettings -Server $srv -ErrorAction Stop).X509CertificateName)"
+                $t = Get-PopImapTarget -Server $srv -Current $cur
+                $script:ui.PopImapNameBox.Text = $t.Name
+                Write-Log "POP/IMAP host name suggested: $($t.Name) ($($t.Source)). Change it on tab 3 if clients use another name."
+            }
+            catch { Write-Log "Could not suggest a POP/IMAP name: $($_.Exception.Message)" WARN }
+        })
     $script:Window.Add_Closed({ if ($script:ExoConnectedByTool) { try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction Stop } catch { } } })
     $ui.CsrCreateButton.Add_Click({ Invoke-UiAction 'Create CSR' { New-CertificateRequest } })
     $ui.CsrCompleteButton.Add_Click({ Invoke-UiAction 'Complete pending request' { Complete-CertificateRequest } })

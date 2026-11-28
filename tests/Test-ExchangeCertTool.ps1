@@ -37,6 +37,7 @@ function Reset-MockOrg {
         Receive    = @{}
         Hybrid     = $oldTls
         Pop        = @{ EX01 = 'mail.contoso.com'; EX02 = 'mail.contoso.com' }
+        PopConn    = @()     # ExternalConnectionSettings, e.g. 'mail.contoso.com:995:SSL'
         NewCert    = (New-MockCert 'NEW1' 'CN=mail.contoso.com' "CN=R12, O=Let's Encrypt, C=US" 'None' 89 $false @('mail.contoso.com', 'autodiscover.contoso.com'))
     }
     foreach ($s in 'EX01', 'EX02') {
@@ -96,8 +97,8 @@ function global:Set-ReceiveConnector { [CmdletBinding()] param($Identity, $TlsCe
 function global:Get-HybridConfiguration { [CmdletBinding()] param() if ($null -ne $Org.Hybrid) { [pscustomobject]@{ TlsCertificateName = $Org.Hybrid } } }
 function global:Set-HybridConfiguration { [CmdletBinding()] param($TlsCertificateName) $Calls.Add('Set-HybridConfiguration'); $Org.Hybrid = $TlsCertificateName }
 function global:Get-AcceptedDomain { [pscustomobject]@{ DomainName = 'contoso.com'; DomainType = 'Authoritative'; Default = $true }; [pscustomobject]@{ DomainName = 'fabrikam.com'; DomainType = 'Authoritative'; Default = $false } }
-function global:Get-PopSettings { [CmdletBinding()] param($Server) [pscustomobject]@{ X509CertificateName = $Org.Pop["$Server"] } }
-function global:Get-ImapSettings { [CmdletBinding()] param($Server) [pscustomobject]@{ X509CertificateName = $Org.Pop["$Server"] } }
+function global:Get-PopSettings { [CmdletBinding()] param($Server) [pscustomobject]@{ X509CertificateName = $Org.Pop["$Server"]; ExternalConnectionSettings = @($Org.PopConn); InternalConnectionSettings = @() } }
+function global:Get-ImapSettings { [CmdletBinding()] param($Server) [pscustomobject]@{ X509CertificateName = $Org.Pop["$Server"]; ExternalConnectionSettings = @($Org.PopConn); InternalConnectionSettings = @() } }
 function global:Set-PopSettings { [CmdletBinding()] param($Server, $X509CertificateName) $Calls.Add("Set-PopSettings $Server"); $Org.Pop["$Server"] = $X509CertificateName }
 function global:Set-ImapSettings { [CmdletBinding()] param($Server, $X509CertificateName) $Calls.Add("Set-ImapSettings $Server"); $Org.Pop["$Server"] = $X509CertificateName }
 function global:Get-ClientAccessService { [CmdletBinding()] param($Identity) [pscustomobject]@{ AutoDiscoverServiceInternalUri = 'https://autodiscover.contoso.com/Autodiscover/Autodiscover.xml' } }
@@ -112,6 +113,8 @@ foreach ($v in 'Owa', 'Ecp', 'WebServices', 'Oab', 'ActiveSync', 'Mapi') {
 $script:Unattended = $true          # confirmations are automatic, no message boxes
 $script:CfTokenFile = Join-Path $tmp 'cf.dpapi'
 $script:RenewalProfileFile = Join-Path $tmp 'renewal.json'
+$script:AuthRotationFile = Join-Path $tmp 'auth-rotation.json'   # never the real %LOCALAPPDATA%
+$script:HybridAppScriptPath = Join-Path $tmp 'hybridapp\ConfigureExchangeHybridApplication.ps1'
 $env:POSHACME_HOME = Join-Path $tmp 'pa'   # empty: keeps the real Posh-ACME folder out of the tests
 New-Item -ItemType Directory -Path $env:POSHACME_HOME | Out-Null
 $logText = { Get-Content -LiteralPath $script:LogFile -Raw }
@@ -224,6 +227,17 @@ Assert-That 'Auth rotation: already scheduled -> no second certificate' ((& $log
 $Org.AuthNextDate = (Get-Date).AddDays(-2); $mark = (& $logText).Length
 Update-Inventory
 Assert-That 'inventory: overdue scheduled Auth certificate is reported' ((& $logText).Substring($mark) -match 'was due on .* but Exchange has not made it current yet')
+# Exchange switched by itself: inventory says so; the button recycles OWA/ECP (no service restart) and forgets the rotation
+$rotSaved = Test-Path -LiteralPath $script:AuthRotationFile
+$Org.Auth = 'AUTH2'; $Org.AuthNext = $null; $Org.AuthNextDate = $null
+$mark = (& $logText).Length
+Update-Inventory
+Assert-That 'Auth rotation: state remembered, switch detected by the inventory' ($rotSaved -and (& $logText).Substring($mark) -match 'Exchange has switched to the scheduled Auth certificate AUTH2')
+function Invoke-Command { param($ComputerName, $ScriptBlock, $ArgumentList, $ErrorAction) $Calls.Add("Invoke-Command $ComputerName $($ArgumentList -join ',')") }
+$Calls.Clear(); $mark = (& $logText).Length
+Invoke-AuthCertificate
+Assert-That 'Auth switch follow-up: OWA/ECP recycled on both servers without restarting services, rotation forgotten' (@($Calls -like 'Invoke-Command *.contoso.local False').Count -eq 2 -and @($Calls -like 'New-ExchangeCertificate*').Count -eq 0 -and -not (Test-Path -LiteralPath $script:AuthRotationFile) -and (& $logText).Substring($mark) -match 'rotation to AUTH2 completed')
+Remove-Item function:Invoke-Command
 Set-Item -Path function:global:New-ExchangeCertificate -Value $realNew; Set-Item -Path function:global:Import-ExchangeCertificate -Value $realImp
 $script:ui.DryRunCheck.IsChecked = $true
 Reset-MockOrg
@@ -638,6 +652,79 @@ function global:Get-AuthConfig { [pscustomobject]@{ CurrentCertificateThumbprint
 Remove-Item function:Start-Process, function:Invoke-WebRequest, function:Get-AuthenticodeSignature
 $script:ui.DryRunCheck.IsChecked = $true
 Reset-MockOrg
+
+# ---------------------------------------------------------------------------------------------
+# POP/IMAP host name: connection settings, wildcard certificates, name entered on tab 3
+# ---------------------------------------------------------------------------------------------
+Reset-MockOrg; Update-Inventory; Invoke-ValidatePfx
+$script:ui.PopImapNameBox.Text = ''
+$Org.PopConn = @('autodiscover.contoso.com:995:SSL')
+$tg = Get-PopImapTarget -Server 'EX01' -Current 'ex01.contoso.local'
+Assert-That 'POP/IMAP name: host from the POP/IMAP connection settings is preferred' ($tg.Name -eq 'autodiscover.contoso.com' -and $tg.Source -eq 'POP/IMAP connection settings')
+$script:State.NewNames = @('*.contoso.com', 'contoso.com')
+$Org.PopConn = @('imap.contoso.com:993:SSL')
+Assert-That 'POP/IMAP name, wildcard certificate: host from the connection settings (no guess)' ((Get-PopImapTarget -Server 'EX01' -Current 'ex01.contoso.local').Name -eq 'imap.contoso.com')
+$Org.PopConn = @(); $script:State.NewNames = @('*.contoso.com'); $mark = (& $logText).Length
+$tg = Get-PopImapTarget -Server 'EX01' -Current 'ex01.contoso.local'
+Assert-That 'POP/IMAP name, wildcard only and no hint: mail.<domain> with a warning' ($tg.Name -eq 'mail.contoso.com' -and (& $logText).Substring($mark) -match 'only wildcard names')
+Invoke-ValidatePfx
+$script:ui.PopImapNameBox.Text = 'autodiscover.contoso.com'; $Org.Pop['EX01'] = 'mail.contoso.com'
+$script:ui.DryRunCheck.IsChecked = $true; $Calls.Clear(); $mark = (& $logText).Length
+Set-PopImapCertificateName -Server 'EX01' -ServicesChanged $false
+Assert-That 'POP/IMAP name entered on tab 3 wins over a current name that is also on the certificate' ((& $logText).Substring($mark) -match '\[DRY RUN\] Set-PopSettings -Server EX01 -X509CertificateName autodiscover\.contoso\.com   \(entered on tab 3\)')
+$script:ui.PopImapNameBox.Text = 'pop.fabrikam.com'; $script:ui.PopImapCheck.IsChecked = $true
+$e = $null; try { Invoke-EnableCertificate } catch { $e = $_.Exception.Message }
+Assert-That 'POP/IMAP name not on the certificate: Step B refuses before changing anything' ($e -match "'pop\.fabrikam\.com' is not on the new certificate" -and $Calls.Count -eq 0 -and (& $logText).Substring($mark) -notmatch 'Enable-ExchangeCertificate')
+$script:ui.PopImapNameBox.Text = ''; $script:ui.PopImapCheck.IsChecked = $false
+Reset-MockOrg
+
+# ---------------------------------------------------------------------------------------------
+# Scheduled renewal task (Task Scheduler and the password prompt are mocked)
+# ---------------------------------------------------------------------------------------------
+if (-not (Test-Path -LiteralPath $script:RenewalProfileFile)) { @{ Saved = (Get-Date).ToString('s'); Names = @('mail.contoso.com'); Servers = @('EX01', 'EX02'); Provider = 'x'; Mode = 'HTTP' } | ConvertTo-Json | Set-Content -LiteralPath $script:RenewalProfileFile }
+$me = "$env:USERDOMAIN\$env:USERNAME"
+$global:Reg = New-Object System.Collections.Generic.List[object]; $global:Unreg = New-Object System.Collections.Generic.List[string]; $global:CredAsked = 0
+$global:CredUser = $me
+function Get-Credential { param($UserName, $Message) $global:CredAsked++; New-Object System.Management.Automation.PSCredential($global:CredUser, (ConvertTo-SecureString 'Sup3r-secret' -AsPlainText -Force)) }
+function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory) [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
+function New-ScheduledTaskTrigger { param([switch]$Daily, $At) [pscustomobject]@{ Daily = [bool]$Daily; At = $At } }
+function New-ScheduledTaskSettingsSet { param([switch]$StartWhenAvailable, $ExecutionTimeLimit, $MultipleInstances) [pscustomobject]@{} }
+function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Settings, $RunLevel, $User, $Password, $Description, [switch]$Force, $ErrorAction) $global:Reg.Add([pscustomobject]@{ Name = $TaskName; Args = $Action.Arguments; User = $User; Password = $Password; Trigger = $Trigger; RunLevel = $RunLevel }) }
+function Get-ScheduledTask { param($TaskName, $ErrorAction) if ($TaskName -like '*(test)') { [pscustomobject]@{ State = 'Ready' } } }
+function Unregister-ScheduledTask { param($TaskName, [switch]$Confirm, $ErrorAction) $global:Unreg.Add($TaskName) }
+function Stop-ScheduledTask { param($TaskName, $ErrorAction) }
+$global:TaskExit = 0
+function Start-ScheduledTask { param($TaskName, $ErrorAction)
+    Set-Content -LiteralPath (Join-Path $tmp ('CertRenew_{0:yyyyMMdd_HHmmss}_t.log' -f (Get-Date))) -Value @('Unattended renewal (DRY RUN - add -Live to make changes)', 'Exchange cmdlets available.', "Renewal run finished (exit code $global:TaskExit).")
+    $global:TaskInfo = [pscustomobject]@{ LastRunTime = (Get-Date); LastTaskResult = $global:TaskExit } }
+function Get-ScheduledTaskInfo { param($TaskName, $ErrorAction) $global:TaskInfo }
+$script:RenewTaskCred = $null
+$script:ui.LeTaskTimeBox.Text = '03:00'; $script:ui.LeTaskNotifyBox.Text = 'admin@contoso.com; ops@contoso.com'; $script:ui.LeTaskRemoveOldCheck.IsChecked = $true
+$script:ui.DryRunCheck.IsChecked = $true; $mark = (& $logText).Length
+New-RenewTask
+Assert-That 'renewal task (dry run): command logged, nothing registered, no password asked' ((& $logText).Substring($mark) -match '\[DRY RUN\] Register-ScheduledTask .*-Renew -Live -RemoveOld -NotifyTo admin@contoso\.com,ops@contoso\.com' -and $Reg.Count -eq 0 -and $CredAsked -eq 0)
+$script:ui.DryRunCheck.IsChecked = $false; $mark = (& $logText).Length
+New-RenewTask
+$r0 = $Reg[0]
+Assert-That 'renewal task: registered daily 03:00 as the current user, highest, -Renew -Live, this script' ($Reg.Count -eq 1 -and $r0.Name -eq 'ExchangeCertTool renewal' -and $r0.User -eq $me -and $r0.RunLevel -eq 'Highest' -and $r0.Trigger.Daily -and $r0.Trigger.At.ToString('HH:mm') -eq '03:00' -and $r0.Args -match '-Renew -Live -RemoveOld' -and $r0.Args -match [regex]::Escape("-File `"$($script:ToolPath)`""))
+Assert-That 'renewal task: password passed to Task Scheduler only, never logged' ($r0.Password -eq 'Sup3r-secret' -and (& $logText) -notmatch 'Sup3r-secret')
+$script:RenewTaskCred = $null; $global:CredUser = 'OTHERDOMAIN\someone'
+$e = $null; try { New-RenewTask } catch { $e = $_.Exception.Message }
+Assert-That 'renewal task: another user is refused' ($e -match 'must run as' -and $Reg.Count -eq 1)
+$global:CredUser = $me; $script:ui.LeTaskTimeBox.Text = '25:00'
+$e = $null; try { New-RenewTask } catch { $e = $_.Exception.Message }
+Assert-That 'renewal task: invalid time refused' ($e -match "is not HH:mm")
+$script:ui.LeTaskTimeBox.Text = '03:00'
+$Reg.Clear(); $mark = (& $logText).Length
+Test-RenewTask
+$runLog = (& $logText).Substring($mark)
+Assert-That 'test run: temporary task WITHOUT -Live (with -ForceRenew), its log shown, then deleted' ($Reg.Count -eq 1 -and $Reg[0].Name -eq 'ExchangeCertTool renewal (test)' -and $Reg[0].Args -notmatch '-Live' -and $Reg[0].Args -match '-ForceRenew' -and -not $Reg[0].Trigger -and $runLog -match '\|.*Renewal run finished \(exit code 0\)' -and $runLog -match 'Test passed' -and $Unreg -contains 'ExchangeCertTool renewal (test)')
+$global:TaskExit = 1; $Unreg.Clear(); $mark = (& $logText).Length
+Start-Sleep -Seconds 1
+Test-RenewTask
+Assert-That 'test run failing (exit 1): reported as FAILED, temporary task still deleted' ((& $logText).Substring($mark) -match 'Test FAILED: exit code 1' -and $Unreg -contains 'ExchangeCertTool renewal (test)')
+Remove-Item function:Get-Credential, function:New-ScheduledTaskAction, function:New-ScheduledTaskTrigger, function:New-ScheduledTaskSettingsSet, function:Register-ScheduledTask, function:Get-ScheduledTask, function:Unregister-ScheduledTask, function:Stop-ScheduledTask, function:Start-ScheduledTask, function:Get-ScheduledTaskInfo
+$script:RenewTaskCred = $null; $script:ui.DryRunCheck.IsChecked = $true
 
 # ---------------------------------------------------------------------------------------------
 # -ForceRenew never "renews" to the certificate that is already on IIS
